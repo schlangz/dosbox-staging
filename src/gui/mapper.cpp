@@ -1250,6 +1250,11 @@ static void stop_auto_typing()
 	PIC_RemoveEvents(auto_type_queued_button);
 }
 
+void MAPPER_PressKey(const std::string& button, bool pressed)
+{
+	type_button(button, pressed ? TypeAction::Press : TypeAction::Release);
+}
+
 static struct CMapper {
 	SDL_Window *window = nullptr;
 	SDL_Renderer* renderer  = nullptr;

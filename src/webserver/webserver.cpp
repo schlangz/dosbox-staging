@@ -4,9 +4,12 @@
 #include "webserver.h"
 #include "bridge.h"
 #include "private/cpu.h"
+#include "private/debugger.h"
 #include "private/dos.h"
 #include "private/dosbox.h"
+#include "private/keyboard.h"
 #include "private/memory.h"
+#include "private/screenshot.h"
 
 #include <set>
 #include <string>
@@ -68,6 +71,20 @@ static void setup_api_handlers()
 	server.Get("/api/v1/memory/:segment/:offset/:len", ReadMemoryCommand::Get);
 	server.Put("/api/v1/memory/:offset", WriteMemoryCommand::Put);
 	server.Put("/api/v1/memory/:segment/:offset", WriteMemoryCommand::Put);
+
+	server.Get("/api/v1/debugger/status", DebuggerStatusCommand::Get);
+	server.Post("/api/v1/debugger/enable", DebuggerEnableCommand::Post);
+	server.Post("/api/v1/debugger/step", DebuggerStepCommand::Post);
+	server.Post("/api/v1/debugger/go", DebuggerGoCommand::Post);
+	server.Post("/api/v1/debugger/breakpoint/:segment/:offset",
+	           DebuggerAddBreakpointCommand::Post);
+	server.Delete("/api/v1/debugger/breakpoint/:segment/:offset",
+	             DebuggerDeleteBreakpointCommand::Delete);
+
+	server.Post("/api/v1/keyboard/key", KeyboardKeyCommand::Post);
+	server.Post("/api/v1/keyboard/type", KeyboardTypeCommand::Post);
+
+	server.Get("/api/v1/screenshot", ScreenshotCommand::Get);
 }
 
 static std::string strip_port(const std::string& host)

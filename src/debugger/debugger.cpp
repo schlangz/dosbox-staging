@@ -40,6 +40,15 @@
 
 #include <imgui.h>
 
+#include "webserver/bridge.h"
+#include "webserver/private/debugger.h"
+#include "webserver/webserver.h"
+
+using json = nlohmann::json;
+using Webserver::Source;
+using Webserver::num_param;
+using Webserver::send_json;
+
 // forward declarations
 static void DrawCode(void);
 static void DEBUG_RaiseTimerIrq(void);
@@ -2565,8 +2574,181 @@ int32_t DEBUG_Run(int32_t amount, bool quickexit)
 	return ret;
 }
 
+// --- HTTP debugger API ---------------------------------------------------
+//
+// Lets an external process (an AI coding agent, a test harness, ...)
+// drive this debugger over the same HTTP/JSON API webserver/ already
+// exposes for CPU state and memory, instead of typing commands by hand.
+// Commands run on the emulation thread via Webserver::Bridge, which is
+// polled both from the normal run loop (dosbox.cpp) and from
+// DEBUG_CheckKeys() below, so these routes work whether the CPU is
+// currently running freely or already paused in the debugger.
+//
+// There's no push notification for a breakpoint hit during free
+// execution -- GO returns immediately once it has kicked off running
+// again, and DebuggerStatusCommand is how a caller finds out when (or
+// whether) it has stopped again: poll it after GO the same way you'd
+// poll any other "is it done yet" endpoint.
+static std::vector<Webserver::CodeLine> DebugDisassemble(uint16_t cs_val,
+                                                          uint32_t ip, int count)
+{
+	std::vector<Webserver::CodeLine> lines;
+	char dline[200];
+	for (int i = 0; i < count; i++) {
+		PhysPt start = GetAddress(cs_val, ip);
+		Bitu size    = DasmI386(dline, start, ip, cpu.code.big);
+		lines.push_back({cs_val, ip, std::string(dline)});
+		if (size == 0) {
+			break;
+		}
+		ip += static_cast<uint32_t>(size);
+	}
+	return lines;
+}
+
+void Webserver::DebuggerStatusCommand::Execute()
+{
+	paused = debugging;
+	if (paused) {
+		regs.load();
+		code = DebugDisassemble(SegValue(cs), reg_eip, 12);
+	}
+}
+
+void Webserver::DebuggerStatusCommand::Get(const httplib::Request&,
+                                           httplib::Response& res)
+{
+	DebuggerStatusCommand cmd;
+	cmd.WaitForCompletion();
+
+	json j;
+	j["paused"] = cmd.paused;
+	if (cmd.paused) {
+		j["registers"] = cmd.regs;
+		j["code"]      = cmd.code;
+	}
+	send_json(res, j);
+}
+
+void Webserver::DebuggerEnableCommand::Execute()
+{
+	DEBUG_Enable(true);
+	regs.load();
+	code = DebugDisassemble(SegValue(cs), reg_eip, 12);
+}
+
+void Webserver::DebuggerEnableCommand::Post(const httplib::Request&,
+                                            httplib::Response& res)
+{
+	DebuggerEnableCommand cmd;
+	cmd.WaitForCompletion();
+
+	json j;
+	j["paused"]     = true;
+	j["registers"] = cmd.regs;
+	j["code"]       = cmd.code;
+	send_json(res, j);
+}
+
+void Webserver::DebuggerStepCommand::Execute()
+{
+	if (!debugging) {
+		error = "Not paused in the debugger";
+		return;
+	}
+	DEBUG_Run(1, true); // matches F11's own handler: single instruction, stays in debug loop
+	regs.load();
+	code = DebugDisassemble(SegValue(cs), reg_eip, 12);
+}
+
+void Webserver::DebuggerStepCommand::Post(const httplib::Request&,
+                                          httplib::Response& res)
+{
+	DebuggerStepCommand cmd;
+	cmd.WaitForCompletion();
+
+	if (!cmd.error.empty()) {
+		throw std::runtime_error(cmd.error);
+	}
+
+	json j;
+	j["paused"]     = true;
+	j["registers"] = cmd.regs;
+	j["code"]       = cmd.code;
+	send_json(res, j);
+}
+
+void Webserver::DebuggerGoCommand::Execute()
+{
+	if (!debugging) {
+		error = "Not paused in the debugger";
+		return;
+	}
+	debugging = false;
+	DEBUG_Run(1, false);
+}
+
+void Webserver::DebuggerGoCommand::Post(const httplib::Request&,
+                                        httplib::Response& res)
+{
+	DebuggerGoCommand cmd;
+	cmd.WaitForCompletion();
+
+	if (!cmd.error.empty()) {
+		throw std::runtime_error(cmd.error);
+	}
+
+	json j;
+	j["resumed"] = true;
+	send_json(res, j);
+}
+
+void Webserver::DebuggerAddBreakpointCommand::Execute()
+{
+	CBreakpoint::AddBreakpoint(seg, off, false);
+}
+
+void Webserver::DebuggerAddBreakpointCommand::Post(const httplib::Request& req,
+                                                    httplib::Response& res)
+{
+	const auto seg = num_param<uint16_t>(req, Source::Path, "segment");
+	const auto off = num_param<uint32_t>(req, Source::Path, "offset");
+
+	DebuggerAddBreakpointCommand cmd(seg, off);
+	cmd.WaitForCompletion();
+
+	json j;
+	j["segment"] = seg;
+	j["offset"]  = off;
+	send_json(res, j);
+}
+
+void Webserver::DebuggerDeleteBreakpointCommand::Execute()
+{
+	removed = CBreakpoint::DeleteBreakpoint(seg, off);
+}
+
+void Webserver::DebuggerDeleteBreakpointCommand::Delete(const httplib::Request& req,
+                                                         httplib::Response& res)
+{
+	const auto seg = num_param<uint16_t>(req, Source::Path, "segment");
+	const auto off = num_param<uint32_t>(req, Source::Path, "offset");
+
+	DebuggerDeleteBreakpointCommand cmd(seg, off);
+	cmd.WaitForCompletion();
+
+	json j;
+	j["removed"] = cmd.removed;
+	send_json(res, j);
+}
+// --- End HTTP debugger API ------------------------------------------------
+
 uint32_t DEBUG_CheckKeys(void)
 {
+	if (WEBSERVER_IsEnabled()) {
+		Webserver::Bridge::Instance().ProcessRequests();
+	}
+
 	Bits ret       = 0;
 	bool numberrun = false;
 	int key        = DBGUI_GetKey();
