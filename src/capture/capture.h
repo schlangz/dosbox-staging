@@ -55,6 +55,18 @@ void CAPTURE_AddMidiData(const bool sysex, const size_t len, const uint8_t* data
 void CAPTURE_StartVideoCapture();
 void CAPTURE_StopVideoCapture();
 
+// Requests a single rendered-frame screenshot, same as the F5 hotkey's
+// "rendered" variant. The actual PNG write happens asynchronously (on
+// the next render frame, then a background saver thread) -- use
+// CAPTURE_PeekNextImageIndex() beforehand to know its filename.
+void CAPTURE_RequestRenderedScreenshot();
+
+// Returns the index the *next* image capture (raw/upscaled/rendered)
+// will be assigned, without consuming it. Combine with
+// generate_capture_filename() to predict a screenshot's path before
+// requesting it.
+int32_t CAPTURE_PeekNextImageIndex();
+
 bool CAPTURE_IsCapturingAudio();
 bool CAPTURE_IsCapturingImage();
 bool CAPTURE_IsCapturingPostRenderImage();

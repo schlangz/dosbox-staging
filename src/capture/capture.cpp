@@ -580,6 +580,21 @@ static void handle_capture_single_rendered_screenshot_event(const bool pressed)
 	}
 }
 
+void CAPTURE_RequestRenderedScreenshot()
+{
+	if (image_capturer) {
+		image_capturer->RequestRenderedCapture();
+	}
+}
+
+int32_t CAPTURE_PeekNextImageIndex()
+{
+	if (!maybe_create_capture_dir_and_init_capture_indices()) {
+		return 0;
+	}
+	return capture.next_index.image;
+}
+
 static void handle_capture_video_event(bool pressed)
 {
 	// Ignore key-release events

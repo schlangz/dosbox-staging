@@ -75,6 +75,13 @@ void MAPPER_AutoType(std::vector<std::string> &sequence,
                      const uint32_t wait_ms,
                      const uint32_t pacing_ms);
 
+// Immediately presses or releases a single named button (same names as
+// MAPPER_AutoType/AUTOTYPE.COM use, e.g. "esc", "lalt", "x"). Delivered
+// synchronously with no PIC pacing -- for a single key or chord, not a
+// run of text (use MAPPER_AutoType for that, it's paced to avoid
+// overrunning the emulated keyboard buffer).
+void MAPPER_PressKey(const std::string &button, bool pressed);
+
 void MAPPER_CheckEvent(SDL_Event *event);
 
 // Screen fits ~89 characters total without clipping. Allocate a few more bytes
