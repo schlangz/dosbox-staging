@@ -450,6 +450,11 @@ const char* MOUSE_GetInjectionBlockReason(const bool is_press)
 	return nullptr;
 }
 
+bool MOUSE_IsInjecting()
+{
+	return is_injecting;
+}
+
 void MOUSE_InjectButton(const MouseButtonId button_id, const bool pressed)
 {
 	is_injecting = true;
@@ -463,9 +468,14 @@ void MOUSE_InjectMotionRelative(const float x_rel, const float y_rel)
 		return;
 	}
 
+	is_injecting = true;
+
 	// Deliberately does NOT touch state.cursor_x_abs/y_abs. There is no
 	// host pointer to report a new absolute position for, and writing a
-	// made-up one here would teleport the seamless-mode cursor.
+	// made-up one here would teleport the seamless-mode cursor. The DOS
+	// driver recognises the resulting "relative movement with no absolute
+	// component" via MOUSE_IsInjecting(); without that it would drop the
+	// event, since its seamless path only reacts to absolute changes.
 	const float x_scaled = x_rel * mouse_config.sensitivity_coeff_x;
 	const float y_scaled = y_rel * mouse_config.sensitivity_coeff_y;
 	for (const auto interface_id : AllMouseInterfaceIds) {
@@ -477,6 +487,8 @@ void MOUSE_InjectMotionRelative(const float x_rel, const float y_rel)
 			                      state.cursor_y_abs);
 		}
 	}
+
+	is_injecting = false;
 }
 
 bool MOUSE_GetDosPosition(uint16_t& pos_x, uint16_t& pos_y)

@@ -1288,6 +1288,34 @@ static void update_mickeys_on_move(float& dx, float& dy,
 	state.SetMickeyCounterY(mickey_counter_y);
 }
 
+// Last host absolute position that was actually applied to the cursor in
+// seamless mode. Seamless positioning is a resync, not an accumulation --
+// it recomputes the guest position from the host coordinate every time --
+// so it must only run when the host pointer genuinely moved. See move_cursor().
+static float applied_abs_x = 0.0f;
+static float applied_abs_y = 0.0f;
+static bool has_applied_abs = false;
+
+static bool host_abs_has_moved()
+{
+	if (!has_applied_abs) {
+		return true;
+	}
+	// Deliberately tighter than MOUSEDOS_NotifyMoved's own 0.5 epsilon:
+	// this only has to answer "did the host coordinate change at all",
+	// not "is the change worth an event".
+	constexpr float Epsilon = 0.001f;
+	return std::fabs(pending.x_abs - applied_abs_x) > Epsilon ||
+	       std::fabs(pending.y_abs - applied_abs_y) > Epsilon;
+}
+
+static void consume_host_abs()
+{
+	applied_abs_x   = pending.x_abs;
+	applied_abs_y   = pending.y_abs;
+	has_applied_abs = true;
+}
+
 static void move_cursor_captured(const float x_rel, const float y_rel)
 {
 	// Update mickey counters
@@ -1362,11 +1390,27 @@ static uint8_t move_cursor()
 		move_cursor_captured(MOUSE_ClampRelativeMovement(pending.x_rel),
 		                     MOUSE_ClampRelativeMovement(pending.y_rel));
 
-	} else {
+	} else if (host_abs_has_moved()) {
 		move_cursor_seamless(pending.x_rel,
 		                     pending.y_rel,
 		                     pending.x_abs,
 		                     pending.y_abs);
+		consume_host_abs();
+	} else {
+		// The host pointer has not moved since the last time its
+		// position was applied, so there is no new authoritative host
+		// coordinate to re-derive the cursor from. Re-deriving it from
+		// the stale one anyway would overwrite the current position
+		// with wherever the host pointer happens to be parked -- which
+		// silently undoes any out-of-band write (INT 33h AX=04h from
+		// the guest, or a programmatic move) on the very next event of
+		// any kind, a button press included.
+		//
+		// Instead apply whatever relative movement arrived as a delta
+		// on top of the current position, which is what
+		// move_cursor_captured() already does.
+		move_cursor_captured(MOUSE_ClampRelativeMovement(pending.x_rel),
+		                     MOUSE_ClampRelativeMovement(pending.y_rel));
 	}
 
 	// Pending relative movement is now consumed
@@ -1518,6 +1562,18 @@ void MOUSEDOS_NotifyMoved(const float x_rel, const float y_rel,
 		constexpr float Epsilon = 0.5f;
 		if (std::lround(pending.x_abs / Epsilon) != std::lround(x_abs / Epsilon) ||
 		    std::lround(pending.y_abs / Epsilon) != std::lround(y_abs / Epsilon)) {
+			event_needed = true;
+		}
+
+		// A programmatically injected movement has no host pointer
+		// behind it, so it carries a relative delta with a deliberately
+		// unchanged absolute component, and the test above can never
+		// fire for one. Without this the delta is accumulated into
+		// pending.x_rel and then never delivered at all: no event, so
+		// move_cursor() never runs, so the mickey counters never
+		// advance and a guest reading motion through INT 33h AX=0Bh
+		// sees nothing happen.
+		if (MOUSE_IsInjecting() && (x_rel != 0.0f || y_rel != 0.0f)) {
 			event_needed = true;
 		}
 		// TODO: Consider introducing some kind of sensitivity to avoid
@@ -2842,14 +2898,42 @@ bool MOUSEDOS_SetPosition(const uint16_t pos_x, const uint16_t pos_y)
 		return false;
 	}
 
+	MouseDriverState state(*state_segment);
+
+	const float delta_x = static_cast<float>(pos_x) - state.GetPosX();
+	const float delta_y = static_cast<float>(pos_y) - state.GetPosY();
+
 	// Same sequence the INT 33h AX=04h ("position mouse cursor") handler
 	// runs, so a programmatic move is indistinguishable from the guest
 	// moving its own cursor.
-	MouseDriverState state(*state_segment);
 	state.SetPosX(static_cast<float>(pos_x));
 	state.SetPosY(static_cast<float>(pos_y));
 	limit_coordinates();
 	draw_cursor();
+
+	// Advance the relative counters by the equivalent amount as well. A DOS
+	// program is free to track the cursor purely from the motion counters
+	// (INT 33h AX=0Bh) rather than the absolute position (AX=03h); one that
+	// does would otherwise never notice a programmatic move at all, which
+	// looks exactly like the move having been silently ignored.
+	state.SetMickeyCounterX(clamp_to_int16(
+	        state.GetMickeyCounterX() +
+	        std::lround(delta_x * state.GetMickeysPerPixelX())));
+	state.SetMickeyCounterY(clamp_to_int16(
+	        state.GetMickeyCounterY() +
+	        std::lround(delta_y * state.GetMickeysPerPixelY())));
+
+	// Claim the current host coordinate as already applied, so the next
+	// event does not treat a stale host position as new and resync over
+	// the position just written. A genuine host move still overrides it.
+	consume_host_abs();
+
+	// Let the guest know something moved, so a program driven by the
+	// driver's event callback reacts instead of waiting for the next real
+	// host movement.
+	pending.has_mouse_moved = true;
+	maybe_trigger_event();
+
 	return true;
 }
 

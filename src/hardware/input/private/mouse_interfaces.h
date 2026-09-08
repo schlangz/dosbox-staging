@@ -48,6 +48,11 @@ void MOUSEDOS_NotifyButton(const MouseButtons12S buttons_12S);
 // return false if the DOS driver is not resident.
 bool MOUSEDOS_GetPosition(uint16_t& pos_x, uint16_t& pos_y);
 bool MOUSEDOS_SetPosition(const uint16_t pos_x, const uint16_t pos_y);
+
+// True only while a programmatically injected event is being delivered, so
+// an interface can tell one from a real host-pointer event.
+bool MOUSE_IsInjecting();
+
 void MOUSEDOS_NotifyWheel(const float w_rel);
 
 void MOUSEDOS_NotifyModelChanged();
