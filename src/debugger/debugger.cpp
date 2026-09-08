@@ -6,7 +6,9 @@
 
 #if C_DEBUGGER
 
+#include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -16,6 +18,7 @@
 #include <vector>
 
 #include "audio/mixer.h"
+#include "config/config.h"
 #include "config/setup.h"
 #include "cpu/callback.h"
 #include "cpu/cpu.h"
@@ -95,6 +98,18 @@ static std::ofstream cpuLogFile;
 static bool cpuLog       = false;
 static int cpuLogCounter = 0;
 static int cpuLogType    = 1; // log detail
+
+// Execution signature breakpoint (BPSIG) -- see DEBUG_HeavyIsBreakpoint's
+// own comment. Fires when the bytes about to execute at the CURRENT CS:EIP
+// match sigBreakBytes, wherever that ends up being (unlike BP/BPINT, which
+// need the target's live segment:offset known in advance -- no use for
+// overlay-relocated code without a live capture to find that address
+// first). Checked via the same per-instruction hook LOGL uses, which is
+// confirmed to fire under core=auto (dynamic/dynrec), not just
+// core=normal -- unlike plain BP, which core=auto's own opaque block
+// execution skips entirely.
+static bool sigBreakActive = false;
+static std::vector<uint8_t> sigBreakBytes;
 static bool zeroProtect  = false;
 bool logHeavy            = false;
 #endif
@@ -355,10 +370,50 @@ enum EBreakpoint {
 	BKPNT_MEMORY,
 	BKPNT_MEMORY_READ,
 	BKPNT_MEMORY_PROT,
-	BKPNT_MEMORY_LINEAR
+	BKPNT_MEMORY_LINEAR,
+	// Non-pausing execution breakpoint: appends one state line to
+	// LOGPOINTS.TXT and lets the CPU carry straight on. See
+	// WriteLogpointLine() and CBreakpoint::CheckBreakpoint().
+	BKPNT_LOGPOINT
 };
 
 #define BPINT_ALL 0x100
+
+// LOGPOINTS.TXT record layout. Every data record is strictly fixed-width
+// and tab-separated, so a script can either split on '\t' or slice by byte
+// offset, and can seek directly to record N. Changing any width here
+// changes the on-disk format: bump LogpointFormatVersion with it, and
+// update doc/dosbox_debugger_bridge.md in the openprivateer repo.
+constexpr int LogpointFormatVersion = 1;
+
+// Number of 16-bit stack words logged above SS:SP on every logpoint hit.
+// 16 words covers the argument area of the near and far calling
+// conventions this is used against; bump it if a target needs more.
+constexpr int LogpointStackWords = 16;
+
+// Labels are space-padded to exactly this width, and truncated to fit, so
+// a variable-length label cannot vary the record length.
+constexpr size_t LogpointLabelWidth = 24;
+
+// Every numeric field is written "0x" + zero-padded hex, so it parses with
+// a plain int(field, 0) and occupies a constant number of columns.
+constexpr size_t LogpointHexU32Width = 10; // "0x" + 8 digits
+constexpr size_t LogpointHexU16Width = 6;  // "0x" + 4 digits
+
+// Exact byte length of one data record, newline included. Derived from the
+// field widths above rather than hard-coded, and verified against the first
+// record actually written (see WriteLogpointLine).
+constexpr size_t LogpointRecordBytes =
+        LogpointHexU32Width +                            // seq
+        1 + LogpointHexU32Width +                        // ticks
+        1 + LogpointLabelWidth +                         // label
+        1 + LogpointHexU16Width +                        // cs
+        1 + LogpointHexU32Width +                        // eip
+        1 + LogpointHexU32Width +                        // eflags
+        8 * (1 + LogpointHexU32Width) +                  // eax..esp
+        5 * (1 + LogpointHexU16Width) +                  // ds..ss
+        LogpointStackWords * (1 + LogpointHexU16Width) + // s00..sNN
+        1;                                               // '\n'
 
 class CBreakpoint {
 public:
@@ -384,6 +439,14 @@ public:
 	void SetOnce(bool _once)
 	{
 		once = _once;
+	}
+	void SetLogpoint(uint16_t seg, uint32_t off, const std::string& _label)
+	{
+		location = GetAddress(seg, off);
+		type     = BKPNT_LOGPOINT;
+		segment  = seg;
+		offset   = off;
+		label    = _label.substr(0, LogpointLabelWidth);
 	}
 	void SetType(EBreakpoint _type)
 	{
@@ -436,6 +499,18 @@ public:
 	{
 		return alValue;
 	}
+	const char* GetLabel() const noexcept
+	{
+		return label.c_str();
+	}
+	uint32_t GetHitCount() const noexcept
+	{
+		return hitCount;
+	}
+	uint32_t NextHitCount() noexcept
+	{
+		return ++hitCount;
+	}
 #if C_HEAVY_DEBUGGER
 	void FlagMemoryAsRead()
 	{
@@ -458,6 +533,9 @@ public:
 	static CBreakpoint* AddIntBreakpoint(uint8_t intNum, uint16_t ah,
 	                                     uint16_t al, bool once);
 	static CBreakpoint* AddMemBreakpoint(uint16_t seg, uint32_t off);
+	static CBreakpoint* AddLogpoint(uint16_t seg, uint32_t off,
+	                                const std::string& label);
+	static bool DeleteLogpoint(uint16_t seg, uint32_t off);
 	static void DeactivateBreakpoints();
 	static void ActivateBreakpoints();
 	static void ActivateBreakpointsExceptAt(PhysPt adr);
@@ -484,6 +562,9 @@ private:
 	uint8_t intNr    = 0;
 	uint16_t ahValue = 0;
 	uint16_t alValue = 0;
+	// Logpoint
+	std::string label = {};
+	uint32_t hitCount = 0;
 	// Shared
 	bool active = 0;
 	bool once   = 0;
@@ -606,6 +687,203 @@ CBreakpoint* CBreakpoint::AddIntBreakpoint(uint8_t intNum, uint16_t ah,
 	return bp;
 }
 
+// --- Logpoints ------------------------------------------------------------
+// A logpoint records CPU state at a known address and lets the guest run on
+// at full speed, so a small set of them can stay armed through an entire
+// play session. This is the targeted alternative to LOGL, which traces every
+// instruction executed and produces multi-gigabyte files.
+//
+// The file handle stays open across hits; each hit formats into one
+// fixed-size stack buffer and does a single write, with no allocation.
+
+static FILE* logpointFile      = nullptr;
+static bool logpointFileFailed = false;
+
+// Monotonic across every logpoint, so records from different logpoints
+// interleaved in one file still have a total order. Each logpoint also
+// keeps its own hit count, reported by BPLIST.
+static uint32_t logpointSeq = 0;
+
+// Written once per file open, ahead of any data record. Comment lines start
+// with '#' and are the only variable-length lines in the file; a reader
+// skips them and treats every remaining line as a fixed-width record. The
+// block repeats if a later session appends to the same file, which also
+// marks where one session's records end and the next begin.
+static void WriteLogpointHeader(FILE* out)
+{
+	fprintf(out,
+	        "#logpoints\tversion=%d\trecord_bytes=%zu\tstack_words=%d\tlabel_width=%zu\n",
+	        LogpointFormatVersion,
+	        LogpointRecordBytes,
+	        LogpointStackWords,
+	        LogpointLabelWidth);
+	fprintf(out,
+	        "#columns\tseq\tticks\tlabel\tcs\teip\teflags"
+	        "\teax\tebx\tecx\tedx\tesi\tedi\tebp\tesp"
+	        "\tds\tes\tfs\tgs\tss");
+	for (int i = 0; i < LogpointStackWords; ++i) {
+		fprintf(out, "\ts%02d", i);
+	}
+	fprintf(out, "\n");
+}
+
+static FILE* GetLogpointFile()
+{
+	if (logpointFile || logpointFileFailed) {
+		return logpointFile;
+	}
+	const std_fs::path logpoints_txt = "LOGPOINTS.TXT";
+	// Binary append: text mode would translate '\n' to CRLF on Windows and
+	// silently break the fixed record length the format guarantees.
+	logpointFile = fopen(logpoints_txt.string().c_str(), "ab");
+	if (!logpointFile) {
+		logpointFileFailed = true;
+		DEBUG_ShowMsg("DEBUG: LOGPOINTS.TXT couldn't be opened.\n");
+	} else {
+		WriteLogpointHeader(logpointFile);
+		fflush(logpointFile);
+		DEBUG_ShowMsg("DEBUG: Logpoint file '%s' opened.\n",
+		              std_fs::absolute(logpoints_txt).string().c_str());
+	}
+	return logpointFile;
+}
+
+static void WriteLogpointLine(CBreakpoint& bp)
+{
+	FILE* out = GetLogpointFile();
+	if (!out) {
+		return;
+	}
+
+	// Stack window immediately above SS:SP, as 16-bit words. An unreadable
+	// word is written as 0xFFFF rather than dropped, so the column count
+	// never varies; a reader that needs to tell a genuine 0xFFFF from an
+	// unreadable word should check SS:SP against the segment limit itself.
+	char stack[LogpointStackWords * (1 + LogpointHexU16Width) + 1] = {};
+	size_t stack_len     = 0;
+	const PhysPt sp_base = static_cast<PhysPt>(
+	        SegPhys(ss) + (reg_esp & cpu.stack.mask));
+	for (int i = 0; i < LogpointStackWords; ++i) {
+		uint16_t word = 0;
+		if (mem_readw_checked(sp_base + static_cast<PhysPt>(i * 2), &word)) {
+			word = 0xFFFF;
+		}
+		const int written = snprintf(stack + stack_len,
+		                             sizeof(stack) - stack_len,
+		                             "\t0x%04X",
+		                             word);
+		if (written <= 0) {
+			break;
+		}
+		stack_len += static_cast<size_t>(written);
+	}
+
+	// Space-padded and truncated to exactly LogpointLabelWidth columns.
+	char label[LogpointLabelWidth + 1] = {};
+	snprintf(label,
+	         sizeof(label),
+	         "%-*.*s",
+	         static_cast<int>(LogpointLabelWidth),
+	         static_cast<int>(LogpointLabelWidth),
+	         bp.GetLabel());
+
+	bp.NextHitCount();
+
+	// The arithmetic flags are lazily evaluated, so reg_flags on its own can
+	// hold a stale value mid-execution. FillFlags() resolves and returns the
+	// real ones, the same way the interactive debugger's own display does.
+	const uint32_t eflags = FillFlags();
+
+	char line[512];
+	const int len = snprintf(line,
+	                         sizeof(line),
+	                         "0x%08X\t0x%08X\t%s\t0x%04X\t0x%08X\t0x%08X"
+	                         "\t0x%08X\t0x%08X\t0x%08X\t0x%08X"
+	                         "\t0x%08X\t0x%08X\t0x%08X\t0x%08X"
+	                         "\t0x%04X\t0x%04X\t0x%04X\t0x%04X\t0x%04X"
+	                         "%s\n",
+	                         ++logpointSeq,
+	                         PIC_Ticks,
+	                         label,
+	                         SegValue(cs),
+	                         reg_eip,
+	                         eflags,
+	                         reg_eax,
+	                         reg_ebx,
+	                         reg_ecx,
+	                         reg_edx,
+	                         reg_esi,
+	                         reg_edi,
+	                         reg_ebp,
+	                         reg_esp,
+	                         SegValue(ds),
+	                         SegValue(es),
+	                         SegValue(fs),
+	                         SegValue(gs),
+	                         SegValue(ss),
+	                         stack);
+	if (len <= 0) {
+		return;
+	}
+	// snprintf reports the length it wanted, which can exceed the buffer.
+	const size_t to_write = std::min(static_cast<size_t>(len), sizeof(line) - 1);
+
+	// The fixed record length is the format's central promise, so verify it
+	// once against a real record rather than trusting the arithmetic.
+	static bool record_length_checked = false;
+	if (!record_length_checked) {
+		record_length_checked = true;
+		if (to_write != LogpointRecordBytes) {
+			DEBUG_ShowMsg("DEBUG: Logpoint record is %zu bytes, expected %zu -- format constants are out of sync.\n",
+			              to_write,
+			              LogpointRecordBytes);
+		}
+	}
+
+	fwrite(line, 1, to_write, out);
+	// Flushed per hit so the file can be read while the session is still
+	// running. One write per hit is cheap next to the cost of reaching
+	// the logpoint at all.
+	fflush(out);
+}
+
+CBreakpoint* CBreakpoint::AddLogpoint(uint16_t seg, uint32_t off,
+                                      const std::string& label)
+{
+	auto bp = new CBreakpoint();
+	bp->SetLogpoint(seg, off, label);
+	bp->SetOnce(false);
+	// Armed straight away, unlike BP: a logpoint is typically added over
+	// HTTP while the guest is already running freely, so there is no
+	// following GO to run ActivateBreakpoints() for it. Activate() does no
+	// memory patching for this type, in either debugger build.
+	bp->Activate(true);
+	BPoints.push_front(bp);
+	// Open the file up front, so a bad path is reported at arm time
+	// rather than silently at the first hit.
+	GetLogpointFile();
+	return bp;
+}
+
+bool CBreakpoint::DeleteLogpoint(uint16_t seg, uint32_t off)
+{
+	CBreakpoint* found_bp = nullptr;
+	for (auto& bp : BPoints) {
+		if (bp->GetType() == BKPNT_LOGPOINT && bp->GetSegment() == seg &&
+		    bp->GetOffset() == off) {
+			found_bp = bp;
+			break;
+		}
+	}
+	if (!found_bp) {
+		return false;
+	}
+	BPoints.remove(found_bp);
+	delete found_bp;
+	return true;
+}
+// --- End logpoints --------------------------------------------------------
+
 CBreakpoint* CBreakpoint::AddMemBreakpoint(uint16_t seg, uint32_t off)
 {
 	auto bp = new CBreakpoint();
@@ -629,6 +907,13 @@ void CBreakpoint::DeactivateBreakpoints()
 {
 	// deactivate all breakpoints
 	for (auto& bp : BPoints) {
+		// Logpoints stay armed. Deactivation exists to lift the 0xCC
+		// patches while sitting at the prompt, which logpoints never
+		// place, and a logpoint has to survive an unrelated breakpoint
+		// hit to be useful across a whole session.
+		if (bp->GetType() == BKPNT_LOGPOINT) {
+			continue;
+		}
 		bp->Activate(false);
 	}
 }
@@ -657,6 +942,17 @@ bool CBreakpoint::CheckBreakpoint(Bitu seg, Bitu off)
 	// Search matching breakpoint
 	for (auto i = BPoints.begin(); i != BPoints.end(); ++i) {
 		auto bp = (*i);
+
+		// Logpoints are their own case: they record state and the
+		// caller carries on, so this never reports a stop and never
+		// deactivates anything.
+		if (bp->GetType() == BKPNT_LOGPOINT) {
+			if (bp->IsActive() &&
+			    bp->GetLocation() == GetAddress(seg, off)) {
+				WriteLogpointLine(*bp);
+			}
+			continue;
+		}
 
 		if ((bp->GetType() == BKPNT_PHYSICAL) && bp->IsActive() &&
 		    (bp->GetLocation() == GetAddress(seg, off))) {
@@ -903,6 +1199,13 @@ void CBreakpoint::ShowList(void)
 			              nr,
 			              bp->GetOffset(),
 			              bp->GetValue());
+		} else if (bp->GetType() == BKPNT_LOGPOINT) {
+			DEBUG_ShowMsg("%02X. LOGP %04X:%04X %s (%u hits)\n",
+			              nr,
+			              bp->GetSegment(),
+			              bp->GetOffset(),
+			              bp->GetLabel(),
+			              bp->GetHitCount());
 		}
 		nr++;
 	}
@@ -2001,6 +2304,26 @@ bool ParseCommand(char* str)
 		return true;
 	}
 
+	if (command == "LOGP") { // Add new logpoint
+		auto seg = (uint16_t)GetHexValue(found, found);
+		found++; // skip ":"
+		uint32_t ofs = GetHexValue(found, found);
+		while (*found == ' ') {
+			found++;
+		}
+		// ParseCommand uppercased the whole line already, so a label
+		// entered here always lands in the log uppercased. The HTTP
+		// route preserves case.
+		const std::string label = *found ? std::string(found)
+		                                 : std::string("LOGP");
+		CBreakpoint::AddLogpoint(seg, ofs, label);
+		DEBUG_ShowMsg("DEBUG: Set logpoint '%s' at %04X:%04X -> LOGPOINTS.TXT\n",
+		              label.c_str(),
+		              seg,
+		              ofs);
+		return true;
+	}
+
 #if C_HEAVY_DEBUGGER
 
 	if (command == "BPM") { // Add new breakpoint
@@ -2121,6 +2444,36 @@ bool ParseCommand(char* str)
 		return true;
 	}
 
+	if (command == "COREMODE") { // Switch [cpu] core live, e.g. COREMODE NORMAL
+		std::string mode = found;
+		// ParseCommand's own upfront pass already uppercased the whole
+		// line; the "core" config value is conventionally lowercase.
+		for (auto& c : mode) {
+			c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+		}
+		if (mode.empty()) {
+			DEBUG_ShowMsg("DEBUG: COREMODE needs an argument (normal/simple/full/auto/dynamic)\n");
+			return true;
+		}
+		auto* section = dynamic_cast<SectionProp*>(control->GetSection("cpu"));
+		if (!section) {
+			DEBUG_ShowMsg("DEBUG: cpu section not found\n");
+			return true;
+		}
+		auto* property = section->GetProperty("core");
+		if (!property) {
+			DEBUG_ShowMsg("DEBUG: core property not found\n");
+			return true;
+		}
+		// Same live-apply path CONFIG.COM's own "-set cpu core=..." uses
+		// (src/dos/programs.cpp) -- core is Changeable::WhenIdle, not
+		// OnlyAtStart, so this takes effect immediately, mid-run.
+		section->HandleInputLine("core=" + mode);
+		section->ExecuteUpdate(*property);
+		DEBUG_ShowMsg("DEBUG: CPU core switched to '%s'\n", mode.c_str());
+		return true;
+	}
+
 #if C_HEAVY_DEBUGGER
 
 	if (command == "LOG") { // Create Cpu normal log file
@@ -2159,6 +2512,33 @@ bool ParseCommand(char* str)
 		cpuLog        = true;
 		cpuLogCounter = GetHexValue(found, found);
 
+		debugging = false;
+		CBreakpoint::ActivateBreakpointsExceptAt(SegPhys(cs) + reg_eip);
+		DOSBOX_SetNormalLoop();
+		return true;
+	}
+
+	if (command == "BPSIG") { // Arm an execution signature breakpoint, e.g. BPSIG 558BEC5657
+		// found was already uppercased; hex digits are unaffected.
+		// Accepts either "558BEC5657" or "55 8B EC 56 57" -- strip
+		// anything that isn't a hex digit, then parse byte pairs.
+		std::string hex_only;
+		for (const char* p = found; *p != '\0'; ++p) {
+			if (isxdigit(static_cast<unsigned char>(*p))) {
+				hex_only += *p;
+			}
+		}
+		if (hex_only.empty() || hex_only.size() % 2 != 0) {
+			DEBUG_ShowMsg("DEBUG: BPSIG needs an even number of hex digits, e.g. BPSIG 558BEC5657\n");
+			return true;
+		}
+		sigBreakBytes.clear();
+		for (size_t i = 0; i < hex_only.size(); i += 2) {
+			sigBreakBytes.push_back(static_cast<uint8_t>(
+			        std::stoul(hex_only.substr(i, 2), nullptr, 16)));
+		}
+		sigBreakActive = true;
+		DEBUG_ShowMsg("DEBUG: BPSIG armed, %zu byte(s) -- resuming\n", sigBreakBytes.size());
 		debugging = false;
 		CBreakpoint::ActivateBreakpointsExceptAt(SegPhys(cs) + reg_eip);
 		DOSBOX_SetNormalLoop();
@@ -2289,7 +2669,9 @@ bool ParseCommand(char* str)
 		DEBUG_ShowMsg("BPPM   [selector]:[offset]- Set pmode-memory breakpoint (memory change).\n");
 		DEBUG_ShowMsg("BPLM   [linear address]   - Set linear memory breakpoint (memory change).\n");
 #endif
-		DEBUG_ShowMsg("BPLIST                    - List breakpoints.\n");
+		DEBUG_ShowMsg("LOGP   [segment]:[offset] [label] - Set logpoint: append CPU state to\n");
+		DEBUG_ShowMsg("                            LOGPOINTS.TXT on each hit and keep running.\n");
+		DEBUG_ShowMsg("BPLIST                    - List breakpoints and logpoints.\n");
 		DEBUG_ShowMsg("BPDEL  [bpNr] / *         - Delete breakpoint nr / all.\n");
 		DEBUG_ShowMsg("C / D  [segment]:[offset] - Set code / data view address.\n");
 		DEBUG_ShowMsg("DOS MCBS                  - Show Memory Control Block chain.\n");
@@ -2703,6 +3085,23 @@ void Webserver::DebuggerGoCommand::Post(const httplib::Request&,
 	send_json(res, j);
 }
 
+void Webserver::ReDumpToggleCommand::Execute()
+{
+	RE_ToggleDumpEnabled();
+	enabled = g_re_dump_enabled;
+}
+
+void Webserver::ReDumpToggleCommand::Post(const httplib::Request&,
+                                          httplib::Response& res)
+{
+	ReDumpToggleCommand cmd;
+	cmd.WaitForCompletion();
+
+	json j;
+	j["enabled"] = cmd.enabled;
+	send_json(res, j);
+}
+
 void Webserver::DebuggerAddBreakpointCommand::Execute()
 {
 	CBreakpoint::AddBreakpoint(seg, off, false);
@@ -2740,6 +3139,103 @@ void Webserver::DebuggerDeleteBreakpointCommand::Delete(const httplib::Request& 
 	json j;
 	j["removed"] = cmd.removed;
 	send_json(res, j);
+}
+
+void Webserver::DebuggerAddLogpointCommand::Execute()
+{
+	CBreakpoint::AddLogpoint(seg, off, label);
+}
+
+void Webserver::DebuggerAddLogpointCommand::Post(const httplib::Request& req,
+                                                  httplib::Response& res)
+{
+	const auto seg = num_param<uint16_t>(req, Source::Path, "segment");
+	const auto off = num_param<uint32_t>(req, Source::Path, "offset");
+
+	// The label is optional, so an empty body is a valid request.
+	std::string label = "LOGP";
+	if (!req.body.empty()) {
+		auto j = json::parse(req.body);
+		if (j.contains("label")) {
+			if (!j.at("label").is_string()) {
+				throw std::invalid_argument(
+				        "Field 'label' must be a string");
+			}
+			label = j.at("label").get<std::string>();
+		}
+	}
+
+	DebuggerAddLogpointCommand cmd(seg, off, label);
+	cmd.WaitForCompletion();
+
+	json j;
+	j["segment"] = seg;
+	j["offset"]  = off;
+	j["label"]   = label;
+	j["file"]    = "LOGPOINTS.TXT";
+	send_json(res, j);
+}
+
+void Webserver::DebuggerDeleteLogpointCommand::Execute()
+{
+	removed = CBreakpoint::DeleteLogpoint(seg, off);
+}
+
+void Webserver::DebuggerDeleteLogpointCommand::Delete(const httplib::Request& req,
+                                                       httplib::Response& res)
+{
+	const auto seg = num_param<uint16_t>(req, Source::Path, "segment");
+	const auto off = num_param<uint32_t>(req, Source::Path, "offset");
+
+	DebuggerDeleteLogpointCommand cmd(seg, off);
+	cmd.WaitForCompletion();
+
+	json j;
+	j["removed"] = cmd.removed;
+	send_json(res, j);
+}
+
+void Webserver::DebuggerCommandCommand::Execute()
+{
+	if (!debugging) {
+		error = "Not paused in the debugger";
+		return;
+	}
+
+	std::vector<char> buf(command.begin(), command.end());
+	buf.push_back('\0');
+	ParseCommand(buf.data());
+
+	paused = debugging;
+	if (paused) {
+		regs.load();
+		code = DebugDisassemble(SegValue(cs), reg_eip, 12);
+	}
+}
+
+void Webserver::DebuggerCommandCommand::Post(const httplib::Request& req,
+                                             httplib::Response& res)
+{
+	auto j = json::parse(req.body);
+	if (!j.contains("command") || !j.at("command").is_string()) {
+		throw std::invalid_argument("Missing required field: command");
+	}
+	auto command = j.at("command").get<std::string>();
+
+	DebuggerCommandCommand cmd(command);
+	cmd.WaitForCompletion();
+
+	if (!cmd.error.empty()) {
+		throw std::runtime_error(cmd.error);
+	}
+
+	json out;
+	out["paused"] = cmd.paused;
+	if (cmd.paused) {
+		out["registers"] = cmd.regs;
+		out["code"]       = cmd.code;
+	}
+	send_json(res, out);
 }
 // --- End HTTP debugger API ------------------------------------------------
 
@@ -4019,6 +4515,34 @@ void DEBUG_HeavyWriteLogInstruction()
 bool DEBUG_HeavyIsBreakpoint(void)
 {
 	static Bitu zero_count = 0;
+	if (sigBreakActive) {
+		const PhysPt check_addr = SegPhys(cs) + reg_eip;
+		bool match              = true;
+		for (size_t i = 0; i < sigBreakBytes.size() && match; ++i) {
+			uint8_t b = 0;
+			// mem_readb_checked() returns false on SUCCESS (the
+			// common fast-TLB-read path) and true only on a real
+			// read failure -- confirmed against zeroProtect's own
+			// use of the sibling mem_readd_checked() just below,
+			// which checks `!mem_readd_checked(...)` to mean
+			// "read succeeded, value is valid". An earlier version
+			// of this check had the negation backwards, so it
+			// reported "no match" on nearly every real byte
+			// regardless of the actual bytes present -- BPSIG never
+			// fired for any signature as a result.
+			if (mem_readb_checked(check_addr + i, &b) ||
+			    b != sigBreakBytes[i]) {
+				match = false;
+			}
+		}
+		if (match) {
+			sigBreakActive = false;
+			DEBUG_ShowMsg("DEBUG: BPSIG match at %04X:%04X\n",
+			              SegValue(cs), reg_eip);
+			DEBUG_EnableDebugger();
+			return true;
+		}
+	}
 	if (cpuLog) {
 		if (cpuLogCounter > 0) {
 			LogInstruction(SegValue(cs), reg_eip, cpuLogFile);

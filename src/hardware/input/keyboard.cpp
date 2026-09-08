@@ -76,6 +76,10 @@ static bool buffer_overflowed  = false;
 static size_t buffer_start_idx = 0;
 static size_t buffer_num_used  = 0;
 
+// Every key this module discards without telling anyone increments this.
+// See KEYBOARD_GetDroppedKeyCount() for why it exists.
+static uint32_t dropped_key_count = 0;
+
 // Key repetition mechanism data
 
 static struct {
@@ -170,12 +174,16 @@ static void buffer_add(const std::vector<uint8_t>& scan_code)
 {
 	// Ignore unsupported keys, drop everything if buffer overflowed
 	if (scan_code.empty() || buffer_overflowed) {
+		++dropped_key_count;
 		return;
 	}
 
 	// If buffer got overflowed, drop everything until
 	// the controllers queue gets free for the keyboard
 	if (buffer_num_used == buffer_size) {
+		// Note this also discards everything already queued, so the
+		// whole buffer's worth of keys is lost, not just this one.
+		dropped_key_count += buffer_num_used + 1;
 		buffer_num_used   = 0;
 		buffer_overflowed = true;
 		return;
@@ -652,10 +660,12 @@ void KEYBOARD_AddKey(const KBD_KEYS key_type, const bool is_pressed)
 {
 	if (should_wait_for_secure_mode && !control->SecureMode()) {
 		warn_waiting_for_secure_mode();
+		++dropped_key_count;
 		return;
 	}
 
 	if (!is_scanning) {
+		++dropped_key_count;
 		return;
 	}
 
@@ -682,6 +692,19 @@ void KEYBOARD_AddKey(const KBD_KEYS key_type, const bool is_pressed)
 	}
 
 	buffer_add(scan_code);
+}
+
+uint32_t KEYBOARD_GetDroppedKeyCount()
+{
+	return dropped_key_count;
+}
+
+bool KEYBOARD_IsAcceptingInput()
+{
+	if (should_wait_for_secure_mode && !control->SecureMode()) {
+		return false;
+	}
+	return is_scanning && !buffer_overflowed && buffer_num_used < buffer_size;
 }
 
 uint8_t KEYBOARD_GetLedState()

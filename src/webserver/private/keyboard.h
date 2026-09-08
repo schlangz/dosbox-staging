@@ -15,15 +15,32 @@
 
 namespace Webserver {
 
-// Presses and releases a single key, optionally with modifiers held down
-// around it (e.g. key="x", modifiers=["lalt"] for Alt+X). Delivered
-// immediately/atomically, all within one Execute() -- for a single key
-// or chord, not a run of text (see KeyboardTypeCommand for that).
+// How long a key is held down by default, in emulated milliseconds. Matches
+// AUTOTYPE's own press-to-release gap. A zero-length hold is invisible to
+// software that samples key state once per frame, which is why this is not
+// simply "press then release immediately".
+constexpr uint32_t DefaultKeyHoldMs = 50;
+
+// Gap between successive modifier releases in a chord, so they come back up
+// after the key itself and in reverse order.
+constexpr uint32_t ModifierReleaseStaggerMs = 5;
+
+// Presses a single physical key, optionally with modifiers held around it
+// (e.g. key="x", modifiers=["lalt"] for Alt+X), and schedules the releases
+// hold_ms of emulated time later.
+//
+// This is the raw scancode path: the guest sees a real IRQ1/INT 9 scancode
+// pair, so it reaches software that reads the keyboard directly. Button
+// names are PHYSICAL KEY POSITIONS, not characters -- the guest's own
+// keyboard layout decides which character a position produces, so "z" is
+// 'y' on a German layout. Use KeyboardTypeCommand to enter characters.
 class KeyboardKeyCommand : public Command {
 public:
-	KeyboardKeyCommand(std::string key, std::vector<std::string> modifiers)
+	KeyboardKeyCommand(std::string key, std::vector<std::string> modifiers,
+	                   const uint32_t hold_ms)
 	        : key(std::move(key)),
-	          modifiers(std::move(modifiers))
+	          modifiers(std::move(modifiers)),
+	          hold_ms(hold_ms)
 	{}
 
 	void Execute() override;
@@ -32,19 +49,30 @@ public:
 private:
 	std::string key;
 	std::vector<std::string> modifiers;
+	uint32_t hold_ms = DefaultKeyHoldMs;
+
+	// Filled in by Execute() so the response can say whether the key
+	// genuinely reached the guest instead of just reporting HTTP 200.
+	uint32_t dropped      = 0;
+	bool accepting_before = false;
 };
 
-// Types a run of text via DOSBox's own AUTOTYPE mechanism (paced,
-// PIC-timed key events) -- the same code path AUTOTYPE.COM uses, which
-// avoids overrunning the emulated keyboard buffer. Returns immediately
-// once queued; the actual typing happens over the following time as the
-// PIC events fire.
+// Types a run of text by writing characters straight into the BIOS keyboard
+// ring buffer, the same buffer INT 16h reads from. Layout-independent: the
+// requested character is the character the guest receives, and every
+// printable ASCII character works, shifted symbols included.
+//
+// Reaches anything reading keys through INT 16h / DOS (the shell,
+// text-mode programs). Does NOT reach software with its own INT 9 handler
+// reading scancodes directly -- use KeyboardKeyCommand for that.
+//
+// Returns once queued. The BIOS ring holds 15 entries, so longer text is
+// drip-fed as the guest consumes it.
 class KeyboardTypeCommand : public Command {
 public:
-	KeyboardTypeCommand(std::string text, uint32_t wait_ms, uint32_t pace_ms)
+	KeyboardTypeCommand(std::string text, const uint32_t wait_ms)
 	        : text(std::move(text)),
-	          wait_ms(wait_ms),
-	          pace_ms(pace_ms)
+	          wait_ms(wait_ms)
 	{}
 
 	void Execute() override;
@@ -53,7 +81,12 @@ public:
 private:
 	std::string text;
 	uint32_t wait_ms = 0;
-	uint32_t pace_ms = 0;
+
+	uint32_t queued  = 0;
+	uint32_t backlog = 0;
+	// Characters with no BIOS-buffer representation, reported back rather
+	// than silently skipped.
+	std::string unsupported = {};
 };
 
 } // namespace Webserver

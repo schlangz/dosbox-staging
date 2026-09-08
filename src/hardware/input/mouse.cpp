@@ -397,8 +397,15 @@ static void update_state() // updates whole 'state' structure, except cursor vis
 // While paused, host mouse motion would otherwise accumulate into the DOS
 // driver's pending delta and deliver as a single large jump on resume.
 //
+// Set only while an injected (programmatic) event is being delivered -- see
+// the "Programmatic input injection" section below.
+static bool is_injecting = false;
+
 static bool should_drop_move()
 {
+	if (is_injecting) {
+		return MOUSE_GetInjectionBlockReason(false) != nullptr;
+	}
 	return state.should_drop_events ||
 	       (state.cursor_is_outside && !state.is_seamless) ||
 	       DOSBOX_IsPaused();
@@ -406,8 +413,80 @@ static bool should_drop_move()
 
 static bool should_drop_press_or_wheel()
 {
+	if (is_injecting) {
+		return MOUSE_GetInjectionBlockReason(true) != nullptr;
+	}
 	return state.should_drop_events ||
 	       state.cursor_is_outside;
+}
+
+// ***************************************************************************
+// Programmatic input injection
+// ***************************************************************************
+//
+// is_injecting (declared above, next to the gating predicates it disarms) is
+// set only while an injected event is being delivered. Most of that gating
+// exists to answer "is the user's host pointer pointed at the guest right
+// now" -- is the window focused, is the mouse captured, is the cursor over
+// the draw area. An automated controller has no host pointer, so those
+// questions have no meaning for the events it injects, and answering them
+// the usual way silently discards every one of them. The flag is scoped to
+// a single injected call, so real host input is completely unaffected.
+
+const char* MOUSE_GetInjectionBlockReason(const bool is_press)
+{
+	// Only the conditions that genuinely still apply to injected events.
+	// Capture state, window focus and host cursor position deliberately do
+	// not appear here: injection bypasses them.
+	if (state.gui_has_taken_over) {
+		return "A DOSBox GUI has taken over the mouse";
+	}
+	if (mouse_config.capture == MouseCapture::NoMouse) {
+		return "Mouse emulation is disabled (mouse_capture = nomouse)";
+	}
+	if (!is_press && DOSBOX_IsPaused()) {
+		return "Emulator is paused";
+	}
+	return nullptr;
+}
+
+void MOUSE_InjectButton(const MouseButtonId button_id, const bool pressed)
+{
+	is_injecting = true;
+	MOUSE_EventButton(button_id, pressed);
+	is_injecting = false;
+}
+
+void MOUSE_InjectMotionRelative(const float x_rel, const float y_rel)
+{
+	if (MOUSE_GetInjectionBlockReason(false)) {
+		return;
+	}
+
+	// Deliberately does NOT touch state.cursor_x_abs/y_abs. There is no
+	// host pointer to report a new absolute position for, and writing a
+	// made-up one here would teleport the seamless-mode cursor.
+	const float x_scaled = x_rel * mouse_config.sensitivity_coeff_x;
+	const float y_scaled = y_rel * mouse_config.sensitivity_coeff_y;
+	for (const auto interface_id : AllMouseInterfaceIds) {
+		auto& interface = MouseInterface::GetInstance(interface_id);
+		if (interface.IsUsingHostPointer()) {
+			interface.NotifyMoved(x_scaled,
+			                      y_scaled,
+			                      state.cursor_x_abs,
+			                      state.cursor_y_abs);
+		}
+	}
+}
+
+bool MOUSE_GetDosPosition(uint16_t& pos_x, uint16_t& pos_y)
+{
+	return MOUSEDOS_GetPosition(pos_x, pos_y);
+}
+
+bool MOUSE_SetDosPosition(const uint16_t pos_x, const uint16_t pos_y)
+{
+	return MOUSEDOS_SetPosition(pos_x, pos_y);
 }
 
 void MOUSE_UpdateGFX()
@@ -624,25 +703,31 @@ void MOUSE_EventButton(const MouseButtonId button_id, const bool pressed)
 	// to concrete interfaces, they will decide whether to
 	// ignore them or not.
 	if (pressed) {
-		// Handle mouse capture by button click
-		if (state.should_capture_on_click) {
-			state.capture_was_requested = true;
-			MOUSE_UpdateGFX();
-			return;
-		}
+		// Capture-toggling clicks are a host-side UI gesture, so an
+		// injected press must never be consumed by one -- it is meant
+		// for the guest, and with the default mouse_capture = onclick
+		// every injected click would otherwise be swallowed here.
+		if (!is_injecting) {
+			// Handle mouse capture by button click
+			if (state.should_capture_on_click) {
+				state.capture_was_requested = true;
+				MOUSE_UpdateGFX();
+				return;
+			}
 
-		const auto is_middle = (button_id == MouseButtonId::Middle);
+			const auto is_middle = (button_id == MouseButtonId::Middle);
 
-		// Handle mouse capture toggle by middle click
-		if (is_middle && state.should_capture_on_middle) {
-			state.capture_was_requested = true;
-			MOUSE_UpdateGFX();
-			return;
-		}
-		if (is_middle && state.should_release_on_middle) {
-			state.capture_was_requested = false;
-			MOUSE_UpdateGFX();
-			return;
+			// Handle mouse capture toggle by middle click
+			if (is_middle && state.should_capture_on_middle) {
+				state.capture_was_requested = true;
+				MOUSE_UpdateGFX();
+				return;
+			}
+			if (is_middle && state.should_release_on_middle) {
+				state.capture_was_requested = false;
+				MOUSE_UpdateGFX();
+				return;
+			}
 		}
 
 		// Drop unneeded events

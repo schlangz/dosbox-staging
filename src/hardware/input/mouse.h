@@ -139,6 +139,44 @@ void MOUSE_NewScreenParams(const MouseScreenParams &params);
 void MOUSE_ToggleUserCapture(const bool pressed);
 
 // ***************************************************************************
+// Programmatic control (HTTP automation API)
+// ***************************************************************************
+
+// Reads / writes the DOS (INT 33h) driver's own cursor position, in the
+// guest's own coordinate space -- the same values INT 33h AX=03h reports and
+// AX=04h sets. Both return false if no DOS mouse driver is resident.
+//
+// Writing the position this way is deterministic: it bypasses mouse capture,
+// window focus, seamless mode and every sensitivity coefficient, exactly as
+// the guest's own AX=04h call does. That makes it the reliable way to place
+// the cursor at a known guest coordinate, unlike MOUSE_EventMoved, whose
+// relative deltas are scaled by up to three independent coefficients and
+// whose absolute pair the DOS driver only honours while uncaptured.
+bool MOUSE_GetDosPosition(uint16_t& pos_x, uint16_t& pos_y);
+bool MOUSE_SetDosPosition(const uint16_t pos_x, const uint16_t pos_y);
+
+// Injects a button or relative motion event. These bypass the host-pointer
+// gating that normal GFX-sourced events go through -- window focus, mouse
+// capture state, and whether the host cursor is over the draw area -- since
+// none of those apply to an event that no host pointer generated. They
+// otherwise take the identical path, so every mouse interface (DOS, PS/2,
+// serial) sees them and per-interface button tracking stays consistent.
+//
+// Relative motion deliberately leaves the absolute host-cursor position
+// alone, and is scaled by the same sensitivity coefficients real motion is,
+// so deltas do not map 1:1 to guest pixels. To place the cursor at a known
+// guest coordinate, use MOUSE_SetDosPosition instead.
+void MOUSE_InjectButton(const MouseButtonId button_id, const bool pressed);
+void MOUSE_InjectMotionRelative(const float x_rel, const float y_rel);
+
+// Returns nullptr if an injected event would reach the guest right now, or a
+// short reason string if it would still be discarded. Only conditions that
+// genuinely survive injection are reported: a DOSBox GUI holding the mouse,
+// mouse emulation being switched off entirely, and (for motion) the emulator
+// being paused. is_press selects between the button and motion rules.
+const char* MOUSE_GetInjectionBlockReason(const bool is_press);
+
+// ***************************************************************************
 // BIOS mouse interface for PS/2 mouse
 // ***************************************************************************
 

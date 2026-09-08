@@ -207,7 +207,10 @@ public:
 enum TypeAction : bool { Press, Release };
 
 // A helper function that either presses or releases the named button.
-static void type_button(const std::string& button, const TypeAction action)
+// Returns false if there is no button by that name, so a caller driving the
+// mapper programmatically can report a bad name instead of silently doing
+// nothing.
+static bool type_button(const std::string& button, const TypeAction action)
 {
 	const auto button_name = "key_" + button;
 
@@ -217,11 +220,12 @@ static void type_button(const std::string& button, const TypeAction action)
 	});
 	if (it != events.end()) {
 		(*it)->Active(action == TypeAction::Press);
-	} else {
-		LOG_ERR("MAPPER: Couldn't find a button named '%s' to %s",
-		        button.c_str(),
-		        action == TypeAction::Press ? "press" : "release");
+		return true;
 	}
+	LOG_ERR("MAPPER: Couldn't find a button named '%s' to %s",
+	        button.c_str(),
+	        action == TypeAction::Press ? "press" : "release");
+	return false;
 }
 
 class CBind {
@@ -1250,9 +1254,42 @@ static void stop_auto_typing()
 	PIC_RemoveEvents(auto_type_queued_button);
 }
 
-void MAPPER_PressKey(const std::string& button, bool pressed)
+bool MAPPER_PressKey(const std::string& button, bool pressed)
 {
-	type_button(button, pressed ? TypeAction::Press : TypeAction::Release);
+	return type_button(button, pressed ? TypeAction::Press : TypeAction::Release);
+}
+
+// Buttons waiting for a scheduled release, in the order they were queued.
+// One PIC event is armed per entry, and they fire in the order they were
+// added, so this stays in step with the queue.
+static std::queue<std::string> timed_release_queue = {};
+
+static void release_timed_button(uint32_t /* unused */)
+{
+	if (timed_release_queue.empty()) {
+		return;
+	}
+	type_button(timed_release_queue.front(), TypeAction::Release);
+	timed_release_queue.pop();
+}
+
+bool MAPPER_ScheduleRelease(const std::string& button, const uint32_t delay_ms)
+{
+	// Verify the name now rather than at release time, so a bad name is
+	// reported to the caller instead of failing silently later.
+	const auto button_name = "key_" + button;
+	const auto it = std::find_if(events.begin(), events.end(), [&](const auto& event) {
+		return event->GetName() == button_name;
+	});
+	if (it == events.end()) {
+		LOG_ERR("MAPPER: Couldn't find a button named '%s' to schedule a release for",
+		        button.c_str());
+		return false;
+	}
+
+	timed_release_queue.emplace(button);
+	PIC_AddEvent(release_timed_button, delay_ms, 0);
+	return true;
 }
 
 static struct CMapper {

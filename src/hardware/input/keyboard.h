@@ -210,6 +210,18 @@ void KEYBOARD_WaitForSecureMode();
 // Simulate key press or release
 void KEYBOARD_AddKey(const KBD_KEYS key_type, const bool is_pressed);
 
+// Number of key events discarded by the emulated keyboard since startup,
+// for any of the reasons KEYBOARD_AddKey drops one silently: scanning
+// disabled by the guest, the secure-mode gate, an unsupported key, or the
+// scancode buffer having overflowed. Monotonic. An automated controller
+// injecting keys samples this before and after an injection to tell
+// whether the key genuinely reached the guest, instead of assuming it did.
+uint32_t KEYBOARD_GetDroppedKeyCount();
+
+// Whether the emulated keyboard would accept a key right now. False means
+// any key injected at this instant is discarded.
+bool KEYBOARD_IsAcceptingInput();
+
 // bit 0: scroll_lock, bit 1: num_lock, bit 2: caps_lock
 // TODO: BIOS does not update LEDs as of yet
 uint8_t KEYBOARD_GetLedState();

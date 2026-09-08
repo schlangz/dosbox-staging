@@ -2826,6 +2826,33 @@ static void start_driver()
 	interface.NotifyDosDriverStartup();
 }
 
+bool MOUSEDOS_GetPosition(uint16_t& pos_x, uint16_t& pos_y)
+{
+	if (!MOUSEDOS_IsDriverStarted()) {
+		return false;
+	}
+	pos_x = get_pos_x();
+	pos_y = get_pos_y();
+	return true;
+}
+
+bool MOUSEDOS_SetPosition(const uint16_t pos_x, const uint16_t pos_y)
+{
+	if (!MOUSEDOS_IsDriverStarted()) {
+		return false;
+	}
+
+	// Same sequence the INT 33h AX=04h ("position mouse cursor") handler
+	// runs, so a programmatic move is indistinguishable from the guest
+	// moving its own cursor.
+	MouseDriverState state(*state_segment);
+	state.SetPosX(static_cast<float>(pos_x));
+	state.SetPosY(static_cast<float>(pos_y));
+	limit_coordinates();
+	draw_cursor();
+	return true;
+}
+
 bool MOUSEDOS_StartDriver(const bool force_low_memory)
 {
 	if (MOUSEDOS_IsDriverStarted()) {

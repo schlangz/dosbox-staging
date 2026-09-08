@@ -3,6 +3,7 @@ target_sources(dosboxcommon PRIVATE
   webserver.cpp
   cpu.cpp
   keyboard.cpp
+  mouse.cpp
   memory.cpp
   dos.cpp
   dosbox.cpp

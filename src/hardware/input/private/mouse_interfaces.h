@@ -42,6 +42,12 @@ void MOUSEDOS_FinalizeInterrupt();
 void MOUSEDOS_NotifyMoved(const float x_rel, const float y_rel,
                           const float x_abs, const float y_abs);
 void MOUSEDOS_NotifyButton(const MouseButtons12S buttons_12S);
+
+// Reads / writes the driver's own cursor position in the guest's coordinate
+// space, equivalent to what INT 33h AX=03h reports and AX=04h sets. Both
+// return false if the DOS driver is not resident.
+bool MOUSEDOS_GetPosition(uint16_t& pos_x, uint16_t& pos_y);
+bool MOUSEDOS_SetPosition(const uint16_t pos_x, const uint16_t pos_y);
 void MOUSEDOS_NotifyWheel(const float w_rel);
 
 void MOUSEDOS_NotifyModelChanged();

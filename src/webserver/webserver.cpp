@@ -9,6 +9,7 @@
 #include "private/dosbox.h"
 #include "private/keyboard.h"
 #include "private/memory.h"
+#include "private/mouse.h"
 #include "private/screenshot.h"
 
 #include <set>
@@ -80,9 +81,19 @@ static void setup_api_handlers()
 	           DebuggerAddBreakpointCommand::Post);
 	server.Delete("/api/v1/debugger/breakpoint/:segment/:offset",
 	             DebuggerDeleteBreakpointCommand::Delete);
+	server.Post("/api/v1/debugger/logpoint/:segment/:offset",
+	           DebuggerAddLogpointCommand::Post);
+	server.Delete("/api/v1/debugger/logpoint/:segment/:offset",
+	             DebuggerDeleteLogpointCommand::Delete);
+	server.Post("/api/v1/debugger/command", DebuggerCommandCommand::Post);
+	server.Post("/api/v1/debugger/re_dump_toggle", ReDumpToggleCommand::Post);
 
 	server.Post("/api/v1/keyboard/key", KeyboardKeyCommand::Post);
 	server.Post("/api/v1/keyboard/type", KeyboardTypeCommand::Post);
+
+	server.Get("/api/v1/mouse/status", MouseStatusCommand::Get);
+	server.Post("/api/v1/mouse/move", MouseMoveCommand::Post);
+	server.Post("/api/v1/mouse/button", MouseButtonCommand::Post);
 
 	server.Get("/api/v1/screenshot", ScreenshotCommand::Get);
 }

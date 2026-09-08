@@ -80,7 +80,17 @@ void MAPPER_AutoType(std::vector<std::string> &sequence,
 // synchronously with no PIC pacing -- for a single key or chord, not a
 // run of text (use MAPPER_AutoType for that, it's paced to avoid
 // overrunning the emulated keyboard buffer).
-void MAPPER_PressKey(const std::string &button, bool pressed);
+// Returns false if no button by that name exists, in which case nothing
+// was delivered.
+bool MAPPER_PressKey(const std::string &button, bool pressed);
+
+// Schedules a release of the named button delay_ms of *emulated* time from
+// now, via the same PIC event mechanism MAPPER_AutoType uses. Pairing this
+// with MAPPER_PressKey gives a key a real, non-zero hold duration, which
+// software that samples key state (rather than reading the BIOS buffer)
+// needs in order to observe the key as held at all. Returns false if no
+// button by that name exists, in which case nothing was scheduled.
+bool MAPPER_ScheduleRelease(const std::string &button, const uint32_t delay_ms);
 
 void MAPPER_CheckEvent(SDL_Event *event);
 
