@@ -555,11 +555,13 @@
 			break;
 		}
 	CASE_D(0xe8)												/* CALL Jd */
-		{ 
+		{
 			int32_t addip=Fetchds();
 			SAVEIP;
 			Push_32(reg_eip);
+			const uint32_t shadow_return_ip=reg_eip;
 			reg_eip+=addip;
+			CPU_ShadowStackPush(SegValue(cs),static_cast<uint16_t>(shadow_return_ip),SegValue(cs),static_cast<uint16_t>(reg_eip),'N');
 			continue;
 		}
 	CASE_D(0xe9)												/* JMP Jd */
@@ -655,7 +657,11 @@
 			case 0x02:											/* CALL NEAR Ed */
 				if (rm >= 0xc0 ) {GetEArd;reg_eip=*eard;}
 				else {GetEAa;reg_eip=LoadMd(eaa);}
-				Push_32(GETIP);
+				{
+					const uint32_t shadow_return_ip=GETIP;
+					Push_32(shadow_return_ip);
+					CPU_ShadowStackPush(SegValue(cs),static_cast<uint16_t>(shadow_return_ip),SegValue(cs),static_cast<uint16_t>(reg_eip),'N');
+				}
 				continue;
 			case 0x03:											/* CALL FAR Ed */
 				{

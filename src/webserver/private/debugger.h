@@ -140,6 +140,84 @@ private:
 	bool removed = false;
 };
 
+// Adds or removes a logsig: a logpoint identified by the executing code's
+// own bytes rather than by an address resolved once at arm time, so it
+// follows VROOMM-style relocatable overlay content instead of silently
+// logging whatever later occupies the same physical slot.
+//
+// Body: {"signature": "558BEC...", "offset"?: 0, "label"?: "..."}. There is
+// no address in the path because there is no fixed address at arm time.
+// With a non-zero offset the watched point is entry+offset, re-resolved
+// automatically whenever the overlay instance changes.
+class DebuggerAddLogsigCommand : public Command {
+public:
+	DebuggerAddLogsigCommand(std::vector<uint8_t> signature,
+	                         const uint32_t offset, std::string label)
+	        : signature(std::move(signature)),
+	          offset(offset),
+	          label(std::move(label))
+	{}
+
+	void Execute() override;
+	static void Post(const httplib::Request&, httplib::Response&);
+
+private:
+	std::vector<uint8_t> signature = {};
+	uint32_t offset                = 0;
+	std::string label              = {};
+};
+
+class DebuggerDeleteLogsigCommand : public Command {
+public:
+	DebuggerDeleteLogsigCommand(std::vector<uint8_t> signature, const uint32_t offset)
+	        : signature(std::move(signature)),
+	          offset(offset)
+	{}
+
+	void Execute() override;
+	static void Delete(const httplib::Request&, httplib::Response&);
+
+private:
+	std::vector<uint8_t> signature = {};
+	uint32_t offset                = 0;
+	bool removed                   = false;
+};
+
+// Dynamic CALL recorder control. GET reports state and counts; POST with
+// {"enabled": true|false} arms or disarms it; POST to .../dump writes
+// CALLREC.JSONL. Works only under core=normal, by design.
+class CallrecStatusCommand : public Command {
+public:
+	void Execute() override;
+	static void Get(const httplib::Request&, httplib::Response&);
+
+private:
+	bool enabled          = false;
+	uint32_t edges        = 0;
+	uint32_t call_sites   = 0;
+	uint64_t total_calls  = 0;
+};
+
+class CallrecSetCommand : public Command {
+public:
+	explicit CallrecSetCommand(const bool enable) : enable(enable) {}
+
+	void Execute() override;
+	static void Post(const httplib::Request&, httplib::Response&);
+
+private:
+	bool enable = false;
+};
+
+class CallrecDumpCommand : public Command {
+public:
+	void Execute() override;
+	static void Post(const httplib::Request&, httplib::Response&);
+
+private:
+	int written = 0;
+};
+
 // Runs an arbitrary interactive-debugger command (same syntax as typed at
 // the DEBUG> prompt, e.g. "LOGL 7A120" or "BPM SS:1234") via the same
 // ParseCommand() the UI uses. Only valid while paused -- this is the

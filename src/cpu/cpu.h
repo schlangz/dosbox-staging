@@ -171,6 +171,32 @@ void CPU_ENTER(bool use32, Bitu bytes, Bitu level);
 #define CPU_INT_NOIOPLCHECK 0x8
 
 void CPU_Interrupt(Bitu num, Bitu type, Bitu oldeip);
+void CPU_LogCallGateInt3F(Bitu oldeip);
+void CPU_LogVtable81bDispatch(uint16_t call_cs, uint16_t call_ip,
+                               uint16_t target_cs, uint16_t target_ip);
+
+// RE instrumentation (see cpu.cpp): a generic, target-agnostic shadow call
+// stack plus raw code fingerprinting, so "what's the real static caller of
+// address X" can be answered by reading captured state instead of chasing
+// live segment values across sessions.
+void CPU_ShadowStackPush(uint16_t from_cs, uint16_t from_ip, uint16_t to_cs,
+                          uint16_t to_ip, char kind);
+std::string CPU_FingerprintBytes(uint16_t seg, uint16_t off, int count = 24);
+
+// Gates every RE-instrumentation hook's own disk writes (the
+// all_calls.txt/int3f_trace.txt loggers here, and the RANDMALE dump hook
+// in dos/dos_files.cpp) -- off by default so a normal run doesn't pay for
+// or produce any of this. Does NOT gate the underlying shadow call stack
+// tracking itself (CPU_ShadowStackPush's own push/prune bookkeeping keeps
+// running regardless) -- otherwise turning dumping on mid-session would
+// start with an empty/incomplete call stack instead of real ancestor
+// context from before the flag was flipped. Toggled via CTRL+F9 (see
+// capture.cpp's own init_key_mappings, same "one hotkey flips one piece
+// of state" precedent as CTRL+F7's video-capture toggle) or the
+// /api/v1/debugger/re_dump_toggle HTTP route (see webserver.cpp).
+extern bool g_re_dump_enabled;
+void RE_ToggleDumpEnabled();
+std::string CPU_FormatShadowCallStack();
 static inline void CPU_HW_Interrupt(Bitu num)
 {
 	CPU_Interrupt(num, 0, reg_eip);

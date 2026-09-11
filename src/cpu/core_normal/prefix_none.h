@@ -1,6 +1,12 @@
 // SPDX-FileCopyrightText:  2002-2021 The DOSBox Team
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+// Only core_normal instruments CALLs (see debugger/callrec.h). Every other
+// core that shares this opcode table compiles the hook away entirely.
+#ifndef CALLREC_CORECALL
+#define CALLREC_CORECALL(kind, tcs, tip) ((void)0)
+#endif
+
 	CASE_B(0x00)												/* ADD Eb,Gb */
 		RMEbGb(ADDB);break;
 	CASE_W(0x01)												/* ADD Ew,Gw */
@@ -554,6 +560,7 @@
 		{ 
 			FillFlags();
 			uint16_t newip=Fetchw();uint16_t newcs=Fetchw();
+			CALLREC_CORECALL(CallrecKind::FarDirect,newcs,newip);
 			CPU_CALL(false,newcs,newip,GETIP);
 #if CPU_TRAP_CHECK
 			if (GETFLAG(TF)) {	
@@ -747,6 +754,9 @@
 	CASE_B(0xcd)												/* INT Ib */	
 		{
 			uint8_t num=Fetchb();
+			if (num == 0x3F) {
+				CPU_LogCallGateInt3F(GETIP);
+			}
 #if C_DEBUGGER
 			FillFlags();
 			if (DEBUG_IntBreakpoint(num)) {
@@ -890,11 +900,14 @@
 			break;
 		}
 	CASE_W(0xe8)												/* CALL Jw */
-		{ 
+		{
 			uint16_t addip=Fetchws();
 			SAVEIP;
+			CALLREC_CORECALL(CallrecKind::NearDirect,SegValue(cs),(uint16_t)(reg_eip+addip));
 			Push_16(reg_eip);
+			const uint16_t shadow_return_ip=reg_eip;
 			reg_eip=(uint16_t)(reg_eip+addip);
+			CPU_ShadowStackPush(SegValue(cs),shadow_return_ip,SegValue(cs),reg_eip,'N');
 			continue;
 		}
 	CASE_W(0xe9)												/* JMP Jw */
@@ -1113,7 +1126,12 @@
 			case 0x02:										/* CALL Ev */
 				if (rm >= 0xc0 ) {GetEArw;reg_eip=*earw;}
 				else {GetEAa;reg_eip=LoadMw(eaa);}
-				Push_16(GETIP);
+				{
+					const uint16_t shadow_return_ip=GETIP;
+					CALLREC_CORECALL(CallrecKind::NearIndirect,SegValue(cs),(uint16_t)reg_eip);
+					Push_16(shadow_return_ip);
+					CPU_ShadowStackPush(SegValue(cs),shadow_return_ip,SegValue(cs),reg_eip,'N');
+				}
 				continue;
 			case 0x03:										/* CALL Ep */
 				{
@@ -1121,7 +1139,11 @@
 					GetEAa;
 					uint16_t newip=LoadMw(eaa);
 					uint16_t newcs=LoadMw(eaa+2);
+					if (reg_bx == 0x81b) {
+						CPU_LogVtable81bDispatch(SegValue(cs),GETIP,newcs,newip);
+					}
 					FillFlags();
+					CALLREC_CORECALL(CallrecKind::FarIndirect,newcs,newip);
 					CPU_CALL(false,newcs,newip,GETIP);
 #if CPU_TRAP_CHECK
 					if (GETFLAG(TF)) {	

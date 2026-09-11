@@ -6,8 +6,11 @@
 
 #include <cassert>
 #include <cstddef>
+#include <fstream>
+#include <iomanip>
 #include <memory>
 #include <sstream>
+#include <vector>
 
 #include "config/config.h"
 #include "config/setup.h"
@@ -20,6 +23,7 @@
 #include "gui/titlebar.h"
 #include "hardware/pic.h"
 #include "lazyflags.h"
+#include "misc/logging.h"
 #include "misc/support.h"
 #include "misc/video.h"
 #include "shell/command_line.h"
@@ -862,11 +866,244 @@ void CPU_Exception(Bitu which, Bitu error)
 	              reg_eip);
 }
 
+bool g_re_dump_enabled = false;
+
+void RE_ToggleDumpEnabled()
+{
+	g_re_dump_enabled = !g_re_dump_enabled;
+	LOG_MSG("RE dump instrumentation %s", g_re_dump_enabled ? "ENABLED" : "disabled");
+}
+
+// CTRL+F9 hotkey for the toggle above -- same "one hotkey flips one piece
+// of state" shape as CTRL+F7's own video-capture start/stop
+// (capture.cpp's handle_capture_video_event), including the same
+// ignore-the-key-release-event guard.
+static void handle_re_dump_toggle_event(bool pressed)
+{
+	if (!pressed) {
+		return;
+	}
+	RE_ToggleDumpEnabled();
+}
+
 static uint8_t last_interrupt;
 
 uint8_t CPU_GetLastInterrupt()
 {
 	return last_interrupt;
+}
+
+// ---- RE instrumentation: generic shadow call stack + code fingerprinting ----
+//
+// A live segment value is only ever meaningful for the DOSBox run that
+// produced it -- JEMM's overlay loader decides segments at runtime, and a
+// segment confirmed in one run (e.g. "505C") has no relationship to the
+// same code's segment in the next. Treating a live segment as a stable
+// identifier is a real trap: matching a resolved call-gate segment against
+// an old run's value, or deriving a stub's supposedly-static offset field
+// by reading it out of a stale snapshot at the wrong live address, both
+// silently produce wrong results. The fixes below are general-purpose,
+// not specific to any one target address:
+//
+//  - CPU_FingerprintBytes reads raw code bytes at an arbitrary segment:offset
+//    so the *content* (which is copied byte-for-byte from PRCD.EXE on disk,
+//    confirmed via this project's own before/after overlay-load dumps) can
+//    be grepped directly against the static executable to recover a real,
+//    run-invariant static offset -- no live-address bookkeeping needed.
+//  - The shadow call stack tracks every near/far CALL with the guest SS:SP
+//    at push time, and lazily discards ("prunes") any frame whose recorded
+//    stack depth the CPU has since climbed back above -- so it stays
+//    correct across ordinary RETs, IRETs, longjmp-style stack rewrites, and
+//    anything else, without needing an explicit pop hook on every possible
+//    return path. Deliberately NOT pushed on JMP (including the call-gate's
+//    own resolved `EA` dispatch): a JMP doesn't create a new return frame,
+//    so the original far-CALL frame that reached the call-gate stub stays
+//    on top and visibly shows the true, pre-gate application caller.
+namespace {
+
+struct ShadowFrame {
+	uint16_t from_cs = 0, from_ip = 0; // the call's own return address
+	uint16_t to_cs = 0, to_ip = 0;     // what it called into
+	uint32_t stack_lin = 0; // linear SS:SP right after this call's own
+	                        // return-address push, for staleness pruning
+	char kind = 'N';        // 'N' near call, 'F' far call
+};
+
+constexpr size_t MaxShadowStackDepth = 4096;
+std::vector<ShadowFrame> shadow_call_stack;
+
+void ShadowStackPrune()
+{
+	const uint32_t current_lin = SegPhys(ss) + (reg_esp & cpu.stack.mask);
+	while (!shadow_call_stack.empty() &&
+	       current_lin > shadow_call_stack.back().stack_lin) {
+		shadow_call_stack.pop_back();
+	}
+}
+
+} // namespace
+
+void CPU_ShadowStackPush(uint16_t from_cs, uint16_t from_ip, uint16_t to_cs,
+                          uint16_t to_ip, char kind)
+{
+	// Segments below this are DOSBox/BIOS-resident low-memory service code,
+	// not PRCD.EXE's own code -- confirmed via fingerprint-matched captures:
+	// an extremely high-frequency, persistent near-call loop sitting at
+	// segments 0x18/0xC shows up in every capture regardless of when it's
+	// taken, drowning out real frames, while this project's own already-
+	// identified real overlay/resident segments are consistently 0x2FC and
+	// up. `to_cs` uses the 0xFFFF sentinel for interrupt frames, which are
+	// never filtered here.
+	constexpr uint16_t LowMemoryNoiseThreshold = 0x100;
+	if (from_cs < LowMemoryNoiseThreshold && to_cs < LowMemoryNoiseThreshold) {
+		return;
+	}
+
+	const uint32_t stack_lin = SegPhys(ss) + (reg_esp & cpu.stack.mask);
+
+	// A full session (menu -> load save -> walk to a location -> talk to an
+	// NPC) only takes on the order of 30 real seconds, so rather than
+	// building a new narrow, hypothesis-specific hook (and a rebuild/retest
+	// cycle) for every single guess about which function matters, just log
+	// every real (post-noise-filter) call event unconditionally: sequence
+	// number, from/to, and the stack depth at push time. That's enough to
+	// reconstruct the exact ancestor chain active at ANY later point in the
+	// log offline (same staleness rule as ShadowStackPrune -- discard
+	// entries whose recorded `sp` is below whatever `sp` you're querying
+	// from), and to grep for any target's code fingerprint after the fact
+	// without ever touching DOSBox's source again for a new hypothesis.
+	// Gated on g_re_dump_enabled (CTRL+F9) -- this fires on every single
+	// call, so leaving it unconditionally on produces a 500MB+ log for a
+	// normal session even when nobody's chasing anything right now.
+	if (g_re_dump_enabled) {
+		static std::ofstream log("all_calls.txt", std::ios::app);
+		static uint32_t hit_count = 0;
+		++hit_count;
+		log << std::hex << hit_count << " from=" << from_cs << ":" << from_ip;
+		if (kind == 'I') {
+			log << " int=" << to_ip;
+		} else {
+			log << " to=" << to_cs << ":" << to_ip
+			    << " fp=" << CPU_FingerprintBytes(to_cs, to_ip, 24);
+		}
+		log << " sp=" << stack_lin << std::dec << "\n";
+	}
+
+	ShadowStackPrune();
+	ShadowFrame frame;
+	frame.from_cs = from_cs;
+	frame.from_ip = from_ip;
+	frame.to_cs   = to_cs;
+	frame.to_ip   = to_ip;
+	frame.kind    = kind;
+	frame.stack_lin = stack_lin;
+	shadow_call_stack.push_back(frame);
+	if (shadow_call_stack.size() > MaxShadowStackDepth) {
+		shadow_call_stack.erase(shadow_call_stack.begin());
+	}
+}
+
+std::string CPU_FingerprintBytes(uint16_t seg, uint16_t off, int count)
+{
+	std::ostringstream oss;
+	const PhysPt addr = (static_cast<PhysPt>(seg) << 4) + off;
+	for (int i = 0; i < count; ++i) {
+		oss << std::hex << std::setw(2) << std::setfill('0')
+		    << static_cast<int>(mem_readb(addr + i));
+	}
+	return oss.str();
+}
+
+std::string CPU_FormatShadowCallStack()
+{
+	ShadowStackPrune();
+	std::ostringstream oss;
+	for (auto it = shadow_call_stack.rbegin(); it != shadow_call_stack.rend();
+	     ++it) {
+		oss << "  " << it->kind << " from=" << std::hex << it->from_cs << ":"
+		    << it->from_ip;
+		if (it->kind == 'I') {
+			oss << " int=" << it->to_ip;
+		} else {
+			oss << " to=" << it->to_cs << ":" << it->to_ip;
+		}
+		oss << std::dec
+		    << " fp=" << CPU_FingerprintBytes(it->from_cs, it->from_ip, 24)
+		    << "\n";
+	}
+	return oss.str();
+}
+
+// One-off diagnostic: logs every `CALLF [BX+disp]` indirect far call made
+// with BX==0x81B, PRCD.EXE's own "ResourceStreamObject"-family class-ID
+// used as a fixed offset into a runtime-only (not present in the static
+// file -- confirmed via IDA reporting 0x81B/0x82F "address not mapped")
+// low-memory method-dispatch table. Static analysis can identify the
+// object's constructor and every call SITE, but not what's actually
+// stored in that table at runtime, so this settles it directly: dumps the
+// call site, the resolved target (fingerprint included, so it can be
+// grepped straight into a static offset the same way any live capture
+// is resolved), and the 3 stack words pushed as arguments.
+void CPU_LogVtable81bDispatch(uint16_t call_cs, uint16_t call_ip,
+                               uint16_t target_cs, uint16_t target_ip)
+{
+	if (!g_re_dump_enabled) {
+		return;
+	}
+
+	static int hit_count = 0;
+	++hit_count;
+
+	const PhysPt args_top = SegPhys(ss) + (reg_esp & cpu.stack.mask);
+	const uint16_t arg0 = mem_readw(args_top);
+	const uint16_t arg1 = mem_readw(args_top + 2);
+	const uint16_t arg2 = mem_readw(args_top + 4);
+
+	std::ofstream log("vtable81b_calls.txt", std::ios::app);
+	log << std::hex << hit_count << " call_site=" << call_cs << ":" << call_ip
+	    << " target=" << target_cs << ":" << target_ip
+	    << " target_fp=" << CPU_FingerprintBytes(target_cs, target_ip, 24)
+	    << " args=" << arg0 << "," << arg1 << "," << arg2 << std::dec << "\n"
+	    << CPU_FormatShadowCallStack();
+}
+
+// Logs every INT 3F trap (PRCD.EXE's VROOMM overlay call-gate trampoline).
+// Called from the CPU core right as the `INT Ib` opcode is decoded, before
+// any mode-specific interrupt dispatch/pushing happens -- so the top of the
+// guest stack still holds the true application call site's far-call return
+// address, not yet clobbered by the flags/cs/ip the interrupt is about to
+// push for the trap itself. Works regardless of real/V86/protected mode.
+void CPU_LogCallGateInt3F(Bitu oldeip)
+{
+	if (!g_re_dump_enabled) {
+		return;
+	}
+
+	static int hit_count = 0;
+	++hit_count;
+
+	const uint16_t trap_cs = SegValue(cs);
+	const uint16_t trap_ip = static_cast<uint16_t>(oldeip);
+
+	// CS:IP right now points exactly at the stub's own <offset_lo><offset_hi>
+	// field (the 2 bytes immediately after the CD 3F opcode that was just
+	// fetched) -- this is the compile-time-static, run-invariant identifier
+	// for which overlay routine this stub resolves to. The segment half is
+	// only ever decided live by JEMM's allocator walk and is NOT stable
+	// across different DOSBox sessions, so don't key off that.
+	const uint16_t static_offset = mem_readw(SegPhys(cs) + trap_ip);
+
+	const PhysPt stack_top = SegPhys(ss) + (reg_esp & cpu.stack.mask);
+	const uint16_t caller_ip = mem_readw(stack_top);
+	const uint16_t caller_cs = mem_readw(stack_top + 2);
+
+	std::ofstream log("int3f_trace.txt", std::ios::app);
+	log << std::hex << hit_count << " trap=" << trap_cs << ":" << trap_ip
+	    << " static_offset=" << static_offset << " caller=" << caller_cs
+	    << ":" << caller_ip
+	    << " caller_fp=" << CPU_FingerprintBytes(caller_cs, caller_ip, 24)
+	    << std::dec << "\n"
+	    << CPU_FormatShadowCallStack();
 }
 
 void CPU_Interrupt(Bitu num, Bitu type, Bitu oldeip)
@@ -876,6 +1113,26 @@ void CPU_Interrupt(Bitu num, Bitu type, Bitu oldeip)
 		return;
 	}
 	last_interrupt = num;
+
+	// Software interrupts are a real control-flow transfer just like a
+	// CALL, but weren't tracked by the shadow call stack at all -- so the
+	// boundary between real application code and whatever the interrupt
+	// dispatches into (e.g. DOSBox's own internal INT21 disk-read service
+	// routines) was invisible, and application callers got silently lost
+	// behind unrelated internal noise. This is the single funnel every
+	// interrupt (hardware and software, real/V86/protected mode) passes
+	// through before any mode-specific dispatch, so it's the correct
+	// mode-agnostic hook point (same reasoning as CPU_LogCallGateInt3F's
+	// own hook placement). Hardware IRQs are deliberately excluded here
+	// (timer/keyboard fire far too often and would flood the ring buffer
+	// with noise unrelated to any RE target).
+	if (type & CPU_INT_SOFTWARE) {
+		CPU_ShadowStackPush(SegValue(cs),
+		                     static_cast<uint16_t>(oldeip),
+		                     0xFFFF,
+		                     static_cast<uint16_t>(num),
+		                     'I');
+	}
 
 	FillFlags();
 #if C_DEBUGGER
@@ -1555,6 +1812,7 @@ void CPU_JMP(bool use32, Bitu selector, Bitu offset, Bitu oldeip)
 
 void CPU_CALL(bool use32, Bitu selector, Bitu offset, Bitu oldeip)
 {
+	const uint16_t shadow_from_cs = SegValue(cs);
 	if (!cpu.pmode || (reg_flags & FLAG_VM)) {
 		if (!use32) {
 			CPU_Push16(SegValue(cs));
@@ -1567,6 +1825,11 @@ void CPU_CALL(bool use32, Bitu selector, Bitu offset, Bitu oldeip)
 		}
 		cpu.code.big = false;
 		SegSet16(cs, selector);
+		CPU_ShadowStackPush(shadow_from_cs,
+		                     static_cast<uint16_t>(oldeip),
+		                     static_cast<uint16_t>(selector),
+		                     static_cast<uint16_t>(offset),
+		                     'F');
 		return;
 	} else {
 		CPU_CHECK_COND((selector & 0xfffc) == 0,
@@ -1625,6 +1888,11 @@ void CPU_CALL(bool use32, Bitu selector, Bitu offset, Bitu oldeip)
 			Segs.phys[cs] = call.GetBase();
 			cpu.code.big  = call.Big() > 0;
 			Segs.val[cs]  = (selector & 0xfffc) | cpu.cpl;
+			CPU_ShadowStackPush(shadow_from_cs,
+			                     static_cast<uint16_t>(oldeip),
+			                     static_cast<uint16_t>(selector),
+			                     static_cast<uint16_t>(offset),
+			                     'F');
 			return;
 		case DESC_386_CALL_GATE:
 		case DESC_286_CALL_GATE: {
@@ -3735,6 +4003,13 @@ void CPU_Init()
 	auto section = get_section("cpu");
 
 	cpu_instance = std::make_unique<Cpu>(section);
+
+	// Not F9: CTRL+F9 is already bound to Shutdown (sdl_gui.cpp).
+	MAPPER_AddHandler(handle_re_dump_toggle_event,
+	                   SDL_SCANCODE_F3,
+	                   PRIMARY_MOD,
+	                   "re_dump_toggle",
+	                   "RE Dump");
 }
 
 void CPU_Destroy()

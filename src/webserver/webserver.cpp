@@ -85,6 +85,11 @@ static void setup_api_handlers()
 	           DebuggerAddLogpointCommand::Post);
 	server.Delete("/api/v1/debugger/logpoint/:segment/:offset",
 	             DebuggerDeleteLogpointCommand::Delete);
+	server.Post("/api/v1/debugger/logsig", DebuggerAddLogsigCommand::Post);
+	server.Delete("/api/v1/debugger/logsig", DebuggerDeleteLogsigCommand::Delete);
+	server.Get("/api/v1/debugger/callrec", CallrecStatusCommand::Get);
+	server.Post("/api/v1/debugger/callrec", CallrecSetCommand::Post);
+	server.Post("/api/v1/debugger/callrec/dump", CallrecDumpCommand::Post);
 	server.Post("/api/v1/debugger/command", DebuggerCommandCommand::Post);
 	server.Post("/api/v1/debugger/re_dump_toggle", ReDumpToggleCommand::Post);
 

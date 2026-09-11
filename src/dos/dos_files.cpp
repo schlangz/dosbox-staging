@@ -4,23 +4,185 @@
 
 #include "dos.h"
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <fstream>
+#include <string>
+#include <vector>
 
 #include "dosbox.h"
 #include "dos_windows.h"
 #include "ints/bios.h"
 #include "hardware/memory.h"
+#include "cpu/cpu.h"
 #include "cpu/registers.h"
 #include "dos/drives.h"
 #include "misc/cross.h"
 #include "config/setup.h"
 #include "utils/string_utils.h"
 #include "misc/support.h"
+
+namespace {
+
+// Openprivateer barkeeper-caller investigation: dump full CPU/stack/memory
+// state whenever a read lands inside RANDMALE.PAK's known byte range within
+// PRIV.TRE or RF.TRE, so the caller chain can be walked from a stack
+// snapshot instead of needing to catch a one-time-ever construction event
+// live. Byte ranges confirmed by parsing each .TRE's own directory table
+// directly (PRIV.TRE: data_offset 0x581968; RF.TRE: data_offset 0x58F712;
+// both size 0x329BA).
+constexpr uint32_t kRandmalePrivStart = 0x581968;
+constexpr uint32_t kRandmalePrivEnd   = kRandmalePrivStart + 0x329BA;
+constexpr uint32_t kRandmaleRfStart = 0x58F712;
+constexpr uint32_t kRandmaleRfEnd   = kRandmaleRfStart + 0x329BA;
+
+// FACES.IFF's own RNDM/RNDF FORM > DATA 8-byte payloads -- see
+// doc/formats/cutscene_format.md's "rand_npc" investigation (this
+// project's own barkeeper-identity chain). Offsets confirmed by parsing
+// each .TRE's own FACES.IFF entry directly (not guessed): PRIV.TRE's
+// FACES.IFF is at data_offset 0x1e28e77, RF.TRE's at 0x1baef27 -- these
+// are each file's own RNDM/RNDF DATA chunk payload start, relative
+// offsets 0x968/0x984 within PRIV.TRE's copy and 0x980/0x99c within
+// RF.TRE's (RF's copy is 24 bytes larger due to extra SHAP records).
+constexpr uint32_t kFacesRndmPrivStart = 0x1e297df;
+constexpr uint32_t kFacesRndmPrivEnd   = kFacesRndmPrivStart + 8;
+constexpr uint32_t kFacesRndfPrivStart = 0x1e297fb;
+constexpr uint32_t kFacesRndfPrivEnd   = kFacesRndfPrivStart + 8;
+constexpr uint32_t kFacesRndmRfStart = 0x1baf8a7;
+constexpr uint32_t kFacesRndmRfEnd   = kFacesRndmRfStart + 8;
+constexpr uint32_t kFacesRndfRfStart = 0x1baf8c3;
+constexpr uint32_t kFacesRndfRfEnd   = kFacesRndfRfStart + 8;
+
+bool RangesOverlap(uint32_t a_start, uint32_t a_end, uint32_t b_start, uint32_t b_end)
+{
+	return a_start < b_end && b_start < a_end;
+}
+
+// `amount` is the real byte count about to be read (0 for a plain seek,
+// matching a single-position containment check) -- a real overlap test,
+// not just "does the read's own START position land inside the range",
+// since FACES.IFF is small enough (~2.4KB) that a caller could plausibly
+// read the WHOLE file in one call starting well before RNDM/RNDF's own
+// tiny 8-byte window, which a start-position-only check would silently
+// miss entirely.
+bool IsRandmaleRange(const char* file_name, uint32_t pos, uint32_t amount)
+{
+	const uint32_t read_end = pos + amount;
+	if (RangesOverlap(pos, read_end, kRandmalePrivStart, kRandmalePrivEnd)) {
+		return true;
+	}
+	if (RangesOverlap(pos, read_end, kRandmaleRfStart, kRandmaleRfEnd)) {
+		return true;
+	}
+	if (RangesOverlap(pos, read_end, kFacesRndmPrivStart, kFacesRndmPrivEnd)) {
+		return true;
+	}
+	if (RangesOverlap(pos, read_end, kFacesRndfPrivStart, kFacesRndfPrivEnd)) {
+		return true;
+	}
+	if (RangesOverlap(pos, read_end, kFacesRndmRfStart, kFacesRndmRfEnd)) {
+		return true;
+	}
+	if (RangesOverlap(pos, read_end, kFacesRndfRfStart, kFacesRndfRfEnd)) {
+		return true;
+	}
+	(void)file_name;
+	return false;
+}
+
+bool NameContainsCaseInsensitive(const char* name, const char* needle)
+{
+	std::string upper_name(name);
+	std::string upper_needle(needle);
+	for (auto& c : upper_name) {
+		c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+	}
+	for (auto& c : upper_needle) {
+		c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+	}
+	return upper_name.find(upper_needle) != std::string::npos;
+}
+
+void DumpRandmaleHit(const char* kind, uint32_t pos, uint32_t amount)
+{
+	if (!g_re_dump_enabled) {
+		return;
+	}
+
+	static int hit_count = 0;
+	++hit_count;
+
+	const std::string tag = std::string(kind) + "_" + std::to_string(hit_count);
+	const std::string regs_path = "randmale_hit_" + tag + ".regs.txt";
+	std::ofstream regs_file(regs_path);
+	if (regs_file) {
+		regs_file << "kind=" << kind << "\n"
+		          << "pos=0x" << std::hex << pos
+		          << " amount=0x" << amount << "\n"
+		          << "cs:ip=" << std::hex << SegValue(cs) << ":" << reg_eip << "\n"
+		          << "ds=" << SegValue(ds) << " es=" << SegValue(es)
+		          << " fs=" << SegValue(fs) << " gs=" << SegValue(gs)
+		          << " ss=" << SegValue(ss) << "\n"
+		          << "eax=" << reg_eax << " ebx=" << reg_ebx
+		          << " ecx=" << reg_ecx << " edx=" << reg_edx << "\n"
+		          << "esi=" << reg_esi << " edi=" << reg_edi
+		          << " ebp=" << reg_ebp << " esp=" << reg_esp << "\n";
+		regs_file.close();
+	}
+
+	// A generous raw stack window -- far-call return addresses (IP:CS
+	// pairs) live here; walk it by hand afterward against known code
+	// segments to reconstruct the caller chain.
+	const std::string stack_path = "randmale_hit_" + tag + ".stack.bin";
+	std::ofstream stack_file(stack_path, std::ios::binary);
+	if (stack_file) {
+		constexpr size_t stack_dump_bytes = 4096;
+		std::vector<uint8_t> buf(stack_dump_bytes);
+		MEM_BlockRead(PhysicalMake(SegValue(ss), reg_esp), buf.data(), buf.size());
+		stack_file.write(reinterpret_cast<const char*>(buf.data()),
+		                  static_cast<std::streamsize>(buf.size()));
+		stack_file.close();
+	}
+
+	// Full low-memory snapshot -- loadable into Ghidra as a synthetic
+	// memory block for a proper decompile of whatever's live at this
+	// exact moment, same technique as this project's earlier live-dump
+	// work, but captured automatically instead of via a manual MEMDUMPBIN.
+	const std::string mem_path = "randmale_hit_" + tag + ".mem.bin";
+	std::ofstream mem_file(mem_path, std::ios::binary);
+	if (mem_file) {
+		const size_t total_bytes = std::min<size_t>(MEM_TotalPages() * 4096, 1024 * 1024);
+		std::vector<uint8_t> buf(total_bytes);
+		MEM_BlockRead(0, buf.data(), buf.size());
+		mem_file.write(reinterpret_cast<const char*>(buf.data()),
+		               static_cast<std::streamsize>(buf.size()));
+		mem_file.close();
+	}
+
+	// Generic shadow call stack (see cpu.cpp) plus a code fingerprint of the
+	// current CS:IP -- gives the real static caller chain directly, without
+	// needing to hand-walk push-bp frames or correlate live segments across
+	// runs. Each captured frame includes a fingerprint of its own return
+	// address' code for the same reason.
+	const std::string callstack_path = "randmale_hit_" + tag + ".callstack.txt";
+	std::ofstream callstack_file(callstack_path);
+	if (callstack_file) {
+		callstack_file << "cs:ip=" << std::hex << SegValue(cs) << ":" << reg_eip
+		               << " fp=" << CPU_FingerprintBytes(static_cast<uint16_t>(SegValue(cs)),
+		                                                  static_cast<uint16_t>(reg_eip),
+		                                                  24)
+		               << std::dec << "\n"
+		               << CPU_FormatShadowCallStack();
+		callstack_file.close();
+	}
+}
+
+} // namespace
 
 #define DOS_FILESTART 4
 
@@ -656,6 +818,12 @@ bool DOS_ReadFile(uint16_t entry,uint8_t * data,uint16_t * amount,bool fcb) {
 	uint32_t pos = 0;
 	Files[handle]->Seek(&pos, SEEK_CUR);
 
+	if ((NameContainsCaseInsensitive(Files[handle]->GetName(), "PRIV.TRE") ||
+	     NameContainsCaseInsensitive(Files[handle]->GetName(), "RF.TRE")) &&
+	    IsRandmaleRange(Files[handle]->GetName(), pos, toread)) {
+		DumpRandmaleHit("read", pos, toread);
+	}
+
 	if (region_is_locked(handle, pos, toread)) {
 		DOS_SetError(DOSERR_ACCESS_DENIED);
 		return false;
@@ -721,7 +889,14 @@ bool DOS_SeekFile(uint16_t entry,uint32_t * pos,uint32_t type,bool fcb) {
 		DOS_SetError(DOSERR_INVALID_HANDLE);
 		return false;
 	};
-	return Files[handle]->Seek(pos,type);
+	const bool ret = Files[handle]->Seek(pos, type);
+	if (ret &&
+	    (NameContainsCaseInsensitive(Files[handle]->GetName(), "PRIV.TRE") ||
+	     NameContainsCaseInsensitive(Files[handle]->GetName(), "RF.TRE")) &&
+	    IsRandmaleRange(Files[handle]->GetName(), *pos, 0)) {
+		DumpRandmaleHit("seek", *pos, 0);
+	}
+	return ret;
 }
 
 bool DOS_CloseFile(uint16_t entry, bool fcb, uint8_t * refcnt) {
