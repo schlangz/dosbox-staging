@@ -12,6 +12,8 @@
 #include "private/mouse.h"
 #include "private/screenshot.h"
 
+#include <algorithm>
+#include <cctype>
 #include <set>
 #include <string>
 #include <thread>
@@ -34,26 +36,64 @@ void send_json(httplib::Response& res, const nlohmann::json& j)
 	res.set_content(j.dump(2), "application/json");
 }
 
+void send_error(httplib::Response& res, const int status, const std::string& msg)
+{
+	json j;
+	j["error"] = msg;
+	res.status = status;
+
+	send_json(res, j);
+}
+
+std::string media_type_of(const std::string& content_type)
+{
+	auto type = content_type.substr(0, content_type.find(';'));
+
+	const auto first = type.find_first_not_of(" \t");
+	if (first == std::string::npos) {
+		return {};
+	}
+	const auto last = type.find_last_not_of(" \t");
+	type            = type.substr(first, last - first + 1);
+
+	std::transform(type.begin(), type.end(), type.begin(), [](const char c) {
+		return static_cast<char>(
+		        std::tolower(static_cast<unsigned char>(c)));
+	});
+	return type;
+}
+
 static void error_handler(const httplib::Request&, httplib::Response& res,
                           std::exception_ptr ep)
 {
-	json j;
 	std::string msg;
+	int status = httplib::StatusCode::InternalServerError_500;
 
+	// The status has to tell a caller what to do next: retry the same
+	// request (the emulator was busy), fix the request, or neither.
 	try {
 		if (ep) {
 			std::rethrow_exception(ep);
 		}
+	} catch (const TimeoutError& e) {
+		msg    = e.what();
+		status = httplib::StatusCode::GatewayTimeout_504;
+	} catch (const std::invalid_argument& e) {
+		msg    = e.what();
+		status = httplib::StatusCode::BadRequest_400;
+	} catch (const nlohmann::json::exception& e) {
+		msg    = e.what();
+		status = httplib::StatusCode::BadRequest_400;
+	} catch (const std::out_of_range& e) {
+		msg    = e.what();
+		status = httplib::StatusCode::BadRequest_400;
 	} catch (const std::exception& e) {
 		msg = e.what();
 	} catch (...) {
 		msg = "Unknown error";
 	}
 
-	j["error"] = msg;
-	res.status = httplib::StatusCode::InternalServerError_500;
-
-	send_json(res, j);
+	send_error(res, status, msg);
 }
 
 static httplib::Server server;
@@ -122,6 +162,34 @@ static std::string strip_port(const std::string& host)
 	return host;
 }
 
+// Whether the host part is written as a literal IP address rather than a name.
+//
+// This is what the Host check is really about. DNS rebinding works by making a
+// *name* the browser already trusts resolve to an address the attacker did not
+// have access to; an address literal has no resolution step to subvert, so it
+// cannot be rebound. Accepting literals therefore costs nothing and is what
+// lets a wildcard bind be reached over the machine's own interface addresses.
+static bool is_ip_literal(const std::string& host)
+{
+	if (host.empty()) {
+		return false;
+	}
+
+	// IPv6 literals arrive bracketed, and the brackets are the only place
+	// ':' may appear in a Host value once the port has been stripped.
+	if (host.front() == '[' && host.back() == ']') {
+		const auto inner = host.substr(1, host.size() - 2);
+		return !inner.empty() &&
+		       inner.find_first_not_of("0123456789abcdefABCDEF:.") ==
+		               std::string::npos;
+	}
+
+	// IPv4 dotted quad: digits and dots only, and at least one dot, so a
+	// bare name of digits is not mistaken for one.
+	return host.find_first_not_of("0123456789.") == std::string::npos &&
+	       host.find('.') != std::string::npos;
+}
+
 static void setup_host_validation(const std::string& addr, int port)
 {
 	// Build the set of allowed Host header values to prevent DNS
@@ -145,12 +213,21 @@ static void setup_host_validation(const std::string& addr, int port)
 		add("[::1]");
 	}
 
+	// A wildcard bind is reachable on every interface the host has, so the
+	// Host value a client sends is whichever of those addresses it used.
+	// Enumerating them would still miss a later DHCP change, so accept any
+	// address literal instead; see is_ip_literal().
+	const bool wildcard_bind = (addr == "0.0.0.0" || addr == "::");
+
 	server.set_pre_routing_handler(
-	        [allowed = std::move(allowed)](const httplib::Request& req,
-	                                       httplib::Response& res) {
+	        [allowed = std::move(allowed),
+	         wildcard_bind](const httplib::Request& req, httplib::Response& res) {
 		        const auto host = strip_port(req.get_header_value("Host"));
 
-		        if (allowed.find(host) == allowed.end()) {
+		        const bool ok = (allowed.find(host) != allowed.end()) ||
+		                        (wildcard_bind && is_ip_literal(host));
+
+		        if (!ok) {
 			        LOG_WARNING("WEBSERVER: Rejected request with Host header '%s'",
 			                    req.get_header_value("Host").c_str());
 

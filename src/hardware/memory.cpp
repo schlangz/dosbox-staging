@@ -211,6 +211,79 @@ void MEM_BlockWrite(PhysPt pt, const void *data, size_t size)
 	}
 }
 
+// Whether the page an address now resolves to is backed by nothing at all.
+// IllegalPageHandler answers reads with 0xff and discards writes, one log line
+// each, so a range walked into it would otherwise come back as plausible data.
+// Only meaningful after the address has been accessed once, which is what
+// populates the TLB entry.
+static bool is_unbacked_read_page(const PhysPt addr)
+{
+	return get_tlb_readhandler(addr) == &illegal_page_handler;
+}
+
+static bool is_unbacked_write_page(const PhysPt addr)
+{
+	const auto handler = get_tlb_writehandler(addr);
+
+	// A ROM page also discards the write and logs, so it is a silent
+	// no-op for this caller in exactly the same way.
+	return handler == &illegal_page_handler ||
+	       (handler->flags & PFLAG_HASROM) != 0;
+}
+
+bool MEM_BlockReadOutOfBand(PhysPt pt, void* data, size_t size, PhysPt* failed_at)
+{
+	auto write         = static_cast<uint8_t*>(data);
+	bool entering_page = true;
+
+	while (size--) {
+		if (mem_readb_checked(pt, write)) {
+			if (failed_at) {
+				*failed_at = pt;
+			}
+			return false;
+		}
+		// Checked once per page, right after the access that resolved
+		// its TLB entry, so a long unbacked range costs one log line
+		// rather than one per byte.
+		if (entering_page && is_unbacked_read_page(pt)) {
+			if (failed_at) {
+				*failed_at = pt;
+			}
+			return false;
+		}
+		++write;
+		++pt;
+		entering_page = ((pt & 0xfff) == 0);
+	}
+	return true;
+}
+
+bool MEM_BlockWriteOutOfBand(PhysPt pt, const void* data, size_t size, PhysPt* failed_at)
+{
+	auto read          = static_cast<const uint8_t*>(data);
+	bool entering_page = true;
+
+	while (size--) {
+		if (mem_writeb_checked(pt, *read)) {
+			if (failed_at) {
+				*failed_at = pt;
+			}
+			return false;
+		}
+		if (entering_page && is_unbacked_write_page(pt)) {
+			if (failed_at) {
+				*failed_at = pt;
+			}
+			return false;
+		}
+		++read;
+		++pt;
+		entering_page = ((pt & 0xfff) == 0);
+	}
+	return true;
+}
+
 void MEM_BlockCopy(PhysPt dest,PhysPt src,Bitu size) {
 	mem_memcpy(dest,src,size);
 }

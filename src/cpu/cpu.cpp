@@ -4309,6 +4309,27 @@ PhysPt CPU_LinearAddressOf(const uint16_t seg, const uint32_t offset)
 	return static_cast<PhysPt>((seg << 4) + offset);
 }
 
+bool CPU_IsSelectorResolvable(const uint16_t seg)
+{
+	// Same order of decisions as CPU_LinearAddressOf(), reporting which of
+	// its branches would be taken.
+	if (seg == SegValue(cs)) {
+		return true;
+	}
+
+	if (!cpu.pmode || (reg_flags & FLAG_VM)) {
+		// seg * 16 is what the CPU itself does here.
+		return true;
+	}
+
+	if ((seg & 0xfffc) == 0) {
+		return false;
+	}
+
+	Descriptor desc = {};
+	return cpu.gdt.GetDescriptor(seg, desc);
+}
+
 void CPU_AddConfigSection(const ConfigPtr& conf)
 {
 	assert(conf);

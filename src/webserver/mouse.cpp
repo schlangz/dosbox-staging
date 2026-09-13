@@ -12,6 +12,7 @@
 #include "hardware/input/mouse.h"
 #include "hardware/pic.h"
 #include "json/json.h"
+#include "private/keyboard.h" // input_block_reason()
 
 using json = nlohmann::json;
 
@@ -22,16 +23,22 @@ namespace Webserver {
 void MouseMoveCommand::Execute()
 {
 	if (absolute) {
-		// Deterministic path: no gating, no sensitivity scaling. Fails
-		// only if there is no DOS mouse driver to talk to.
+		// Deterministic path: writes the driver's own position state, so
+		// it lands whether or not the emulation is currently running.
+		// Fails only if there is no DOS mouse driver to talk to.
 		delivered = MOUSE_SetDosPosition(static_cast<uint16_t>(x),
 		                                 static_cast<uint16_t>(y));
 		if (!delivered) {
 			block_reason = "No DOS mouse driver is resident";
 		}
 	} else {
-		block_reason = MOUSE_GetInjectionBlockReason(false);
-		delivered    = (block_reason == nullptr);
+		// A relative move is an injected event, so it also needs the
+		// emulation to be running to be consumed.
+		block_reason = input_block_reason();
+		if (!block_reason) {
+			block_reason = MOUSE_GetInjectionBlockReason(false);
+		}
+		delivered = (block_reason == nullptr);
 		MOUSE_InjectMotionRelative(x, y);
 	}
 
@@ -76,6 +83,10 @@ void MouseMoveCommand::Post(const httplib::Request& req, httplib::Response& res)
 	MouseMoveCommand cmd(has_abs, x, y);
 	cmd.WaitForCompletion();
 
+	if (!cmd.error.empty()) {
+		throw std::runtime_error(cmd.error);
+	}
+
 	json out;
 	out["mode"]      = has_abs ? "absolute" : "relative";
 	out["delivered"] = cmd.delivered;
@@ -113,12 +124,17 @@ void MouseButtonCommand::Execute()
 		return;
 	}
 
-	block_reason = MOUSE_GetInjectionBlockReason(true);
-	delivered    = (block_reason == nullptr);
+	block_reason = input_block_reason();
+	if (!block_reason) {
+		block_reason = MOUSE_GetInjectionBlockReason(true);
+	}
+	delivered = (block_reason == nullptr);
 
 	MOUSE_InjectButton(button_id, true);
 
 	if (action == Action::Click) {
+		// The release rides the PIC event queue, so a click issued while
+		// the emulation is parked holds the button down until it resumes.
 		pending_releases.push(button_id);
 		PIC_AddEvent(release_pending_button, hold_ms, 0);
 	}
@@ -172,6 +188,10 @@ void MouseButtonCommand::Post(const httplib::Request& req, httplib::Response& re
 	MouseButtonCommand cmd(button_id, action, hold_ms);
 	cmd.WaitForCompletion();
 
+	if (!cmd.error.empty()) {
+		throw std::runtime_error(cmd.error);
+	}
+
 	json out;
 	out["button"]    = j.at("button").get<std::string>();
 	out["action"]    = action_name;
@@ -189,15 +209,21 @@ void MouseButtonCommand::Post(const httplib::Request& req, httplib::Response& re
 
 void MouseStatusCommand::Execute()
 {
-	has_position       = MOUSE_GetDosPosition(pos_x, pos_y);
-	move_block_reason  = MOUSE_GetInjectionBlockReason(false);
-	press_block_reason = MOUSE_GetInjectionBlockReason(true);
+	has_position = MOUSE_GetDosPosition(pos_x, pos_y);
+
+	const auto parked  = input_block_reason();
+	move_block_reason  = parked ? parked : MOUSE_GetInjectionBlockReason(false);
+	press_block_reason = parked ? parked : MOUSE_GetInjectionBlockReason(true);
 }
 
 void MouseStatusCommand::Get(const httplib::Request&, httplib::Response& res)
 {
 	MouseStatusCommand cmd;
 	cmd.WaitForCompletion();
+
+	if (!cmd.error.empty()) {
+		throw std::runtime_error(cmd.error);
+	}
 
 	json out;
 	out["dos_driver"] = cmd.has_position;

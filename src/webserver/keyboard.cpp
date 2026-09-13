@@ -9,6 +9,8 @@
 #include <queue>
 #include <stdexcept>
 
+#include "debugger/debugger.h"
+#include "dosbox.h"
 #include "gui/mapper.h"
 #include "hardware/input/keyboard.h"
 #include "hardware/pic.h"
@@ -18,6 +20,32 @@
 using json = nlohmann::json;
 
 namespace Webserver {
+
+// Injected input reaches the guest through the PIC event queue and the guest's
+// own interrupt handling, neither of which advances unless the CPU is running.
+// A press queued while the machine is parked sits there, undelivered, until it
+// resumes, so reporting the enqueue as delivery would be a lie.
+//
+// Two ways to be parked: the emulator is paused (which includes the automatic
+// pause on focus loss, the usual state when driving DOSBox from another
+// process), or the interactive debugger has the CPU stopped.
+const char* input_block_reason()
+{
+	if (DOSBOX_IsPaused()) {
+		return "The emulator is paused, so no injected input reaches the "
+		       "guest until it resumes (note that losing window focus "
+		       "auto-pauses by default)";
+	}
+	if (DOSBOX_IsPauseRequested()) {
+		return "The emulator is pausing, so injected input will not reach "
+		       "the guest until it resumes";
+	}
+	if (DEBUG_IsStopped()) {
+		return "The CPU is stopped in the debugger, so no injected input "
+		       "reaches the guest until execution resumes";
+	}
+	return nullptr;
+}
 
 // --- /keyboard/key: raw scancode injection --------------------------------
 // Goes through the mapper, so the guest sees a genuine IRQ1/INT 9 scancode
@@ -35,6 +63,7 @@ void KeyboardKeyCommand::Execute()
 {
 	const auto dropped_before  = KEYBOARD_GetDroppedKeyCount();
 	accepting_before           = KEYBOARD_IsAcceptingInput();
+	block_reason               = input_block_reason();
 
 	for (const auto& m : modifiers) {
 		if (!MAPPER_PressKey(m, true)) {
@@ -95,11 +124,14 @@ void KeyboardKeyCommand::Post(const httplib::Request& req, httplib::Response& re
 	json out;
 	out["pressed"]   = key;
 	out["hold_ms"]  = hold_ms;
-	out["delivered"] = (cmd.dropped == 0) && cmd.accepting_before;
+	out["delivered"] = (cmd.dropped == 0) && cmd.accepting_before &&
+	                   (cmd.block_reason == nullptr);
 	if (cmd.dropped) {
 		out["dropped_keys"] = cmd.dropped;
 	}
-	if (!cmd.accepting_before) {
+	if (cmd.block_reason) {
+		out["reason"] = std::string(cmd.block_reason);
+	} else if (!cmd.accepting_before) {
 		out["reason"] = "Emulated keyboard is not accepting input (guest "
 		                "disabled scanning, or its scancode buffer overflowed)";
 	}
@@ -214,6 +246,8 @@ static void drain_pending_chars(uint32_t /* unused */)
 
 void KeyboardTypeCommand::Execute()
 {
+	block_reason = input_block_reason();
+
 	for (const char c : text) {
 		// '\n' and '\r' both mean Enter to a DOS program.
 		const char ch = (c == '\n') ? '\r' : c;
@@ -259,10 +293,20 @@ void KeyboardTypeCommand::Post(const httplib::Request& req, httplib::Response& r
 	KeyboardTypeCommand cmd(text, wait_ms);
 	cmd.WaitForCompletion();
 
+	if (!cmd.error.empty()) {
+		throw std::runtime_error(cmd.error);
+	}
+
 	json out;
 	out["queued"] = cmd.queued;
 	out["backlog"] = cmd.backlog;
 	out["estimated_ms"] = wait_ms + cmd.backlog * DrainIntervalMs;
+	// The characters are queued either way; this says whether anything is
+	// going to consume that queue yet.
+	out["draining"] = (cmd.block_reason == nullptr);
+	if (cmd.block_reason) {
+		out["reason"] = std::string(cmd.block_reason);
+	}
 	// Characters with no representation at all, reported rather than
 	// dropped in silence.
 	if (!cmd.unsupported.empty()) {

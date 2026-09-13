@@ -34,6 +34,10 @@ void DosInternalsCommand::Get(const httplib::Request&, httplib::Response& res)
 	DosInternalsCommand cmd;
 	cmd.WaitForCompletion();
 
+	if (!cmd.error.empty()) {
+		throw std::runtime_error(cmd.error);
+	}
+
 	json j;
 	j["listOfLists"]      = cmd.list_of_lists;
 	j["dosSwappableArea"] = cmd.dos_swappable_area;
@@ -183,12 +187,19 @@ void AllocMemoryCommand::Post(const httplib::Request& req, httplib::Response& re
 	AllocMemoryCommand cmd(size, area, strategy);
 	cmd.WaitForCompletion();
 
+	if (!cmd.error.empty()) {
+		throw std::runtime_error(cmd.error);
+	}
+
 	if (cmd.addr) {
 		json j;
 		j["addr"] = cmd.addr;
 		send_json(res, j);
 	} else {
-		res.status = httplib::StatusCode::ServiceUnavailable_503;
+		send_error(res,
+		           httplib::StatusCode::ServiceUnavailable_503,
+		           "Could not allocate " + std::to_string(size) +
+		                   " bytes in the requested memory area");
 	}
 }
 
@@ -220,9 +231,21 @@ void FreeMemoryCommand::Post(const httplib::Request& req, httplib::Response& res
 	FreeMemoryCommand cmd(addr);
 	cmd.WaitForCompletion();
 
-	if (!cmd.success) {
-		res.status = httplib::StatusCode::BadRequest_400;
+	if (!cmd.error.empty()) {
+		throw std::runtime_error(cmd.error);
 	}
+
+	if (!cmd.success) {
+		send_error(res,
+		           httplib::StatusCode::BadRequest_400,
+		           "Nothing allocated by this API was freed at address " +
+		                   std::to_string(addr));
+		return;
+	}
+
+	json out;
+	out["freed"] = true;
+	send_json(res, out);
 }
 
 } // namespace Webserver

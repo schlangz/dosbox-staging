@@ -44,7 +44,11 @@ void CpuStateCommand::Execute()
 void CpuStateCommand::Get(const httplib::Request&, httplib::Response& res)
 {
 	CpuStateCommand cmd;
-	cmd.WaitForCompletion();
+	cmd.WaitForCompletion(StatusCommandTimeoutMs);
+
+	if (!cmd.error.empty()) {
+		throw std::runtime_error(cmd.error);
+	}
 
 	json j;
 	j["registers"] = cmd.regs;

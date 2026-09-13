@@ -12,11 +12,18 @@
 
 namespace Webserver {
 
-// Requests a rendered screenshot and predicts its eventual filename, both
-// atomically within one Execute() on the emulation thread (so nothing
-// else can request a capture in between and desync the prediction). The
-// PNG itself is written asynchronously by a background saver thread --
-// Get() polls for it after this command completes.
+// Requests a rendered screenshot and predicts its eventual filename. The PNG
+// itself is written asynchronously by a background saver thread, so Get()
+// polls for the file after this command completes.
+//
+// LIMITATION, prediction race: the capture index the filename is built from is
+// only consumed when the capture actually happens, inside the image capturer,
+// not when the request is made. Reserving it here would mean the capture
+// subsystem handing back the reserved name, which it has no interface for.
+// Concurrent screenshot requests over HTTP are serialised in Get() so they
+// cannot race each other; a screenshot started from the F5 hotkey in the same
+// window still can, in which case this handler waits for, and returns, the
+// wrong file or times out.
 class ScreenshotCommand : public Command {
 public:
 	void Execute() override;

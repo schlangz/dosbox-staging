@@ -5,6 +5,8 @@
 #include "bridge.h"
 #include "private/memory.h"
 
+#include <cstdio>
+
 #include "base64/base64.h"
 #include "http/http.h"
 #include "json/json.h"
@@ -14,6 +16,7 @@
 // private/cpu.h, not the emulated CPU's header.
 #include "cpu/cpu.h"
 #include "cpu/registers.h"
+#include "debugger/debugger.h"
 #include "dos/dos_memory.h"
 #include "hardware/memory.h"
 
@@ -101,6 +104,22 @@ static MemAddr parse_mem_addr(const httplib::Request& req)
 	return addr;
 }
 
+// Hex spelling of an address, for messages that name one.
+static std::string hex_addr(const uint32_t addr)
+{
+	char buf[16] = {};
+	snprintf(buf, sizeof(buf), "0x%08x", addr);
+	return buf;
+}
+
+// The linear address space is 32 bits wide, so a range may not wrap past its
+// end. Checked before any access, since the accessors walk byte by byte and
+// would silently restart at zero.
+static bool range_fits_address_space(const uint32_t start, const uint64_t len)
+{
+	return static_cast<uint64_t>(start) + len <= 0x1'0000'0000ULL;
+}
+
 void ReadMemoryCommand::Execute()
 {
 	regs.load();
@@ -108,20 +127,28 @@ void ReadMemoryCommand::Execute()
 
 	LOG_DEBUG("API: ReadMemoryCommand(0x%06x, %d)", effective_addr, len);
 
-	const uint64_t mem_total = static_cast<uint64_t>(MEM_TotalPages()) *
-	                           MemPageSize;
-
-	const uint64_t end_addr = static_cast<uint64_t>(effective_addr) + len;
-
-	if (end_addr > mem_total) {
-		error = "Address range 0x" + std::to_string(effective_addr) + " + " +
-		        std::to_string(len) + " exceeds emulated memory size (" +
-		        std::to_string(mem_total) + " bytes)";
+	if (!range_fits_address_space(effective_addr, len)) {
+		error = "Address range " + hex_addr(effective_addr) + " + " +
+		        std::to_string(len) +
+		        " runs past the end of the 32-bit address space";
 		return;
 	}
 
 	memory.resize(len);
-	MEM_BlockRead(effective_addr, memory.data(), len);
+
+	// Reading over HTTP is an observation, not guest execution: it must
+	// neither be recorded as a memory-breakpoint hit nor page anything in
+	// through the guest's own fault handler.
+	const DEBUG_OutOfBandMemoryAccess out_of_band;
+
+	PhysPt failed_at = 0;
+	if (!MEM_BlockReadOutOfBand(effective_addr, memory.data(), len, &failed_at)) {
+		memory.clear();
+		error = "No memory is mapped at " + hex_addr(failed_at) +
+		        " (in the range " + hex_addr(effective_addr) + " + " +
+		        std::to_string(len) + ")";
+		return;
+	}
 }
 
 void ReadMemoryCommand::Get(const Request& req, Response& res)
@@ -157,30 +184,34 @@ void ReadMemoryCommand::Get(const Request& req, Response& res)
 
 void WriteMemoryCommand::Execute()
 {
+	regs.load();
 	effective_addr = resolve_mem_addr(addr);
 
 	LOG_DEBUG("API: WriteMemoryCommand(0x%06x, %d)", effective_addr, data.size());
 
-	const uint64_t mem_total = static_cast<uint64_t>(MEM_TotalPages()) *
-	                           MemPageSize;
-
-	const uint64_t end_addr = static_cast<uint64_t>(effective_addr) +
-	                          data.size();
-
-	if (end_addr > mem_total) {
-		error = "Address range 0x" + std::to_string(effective_addr) +
-		        " + " + std::to_string(data.size()) +
-		        " exceeds emulated memory size (" +
-		        std::to_string(mem_total) + " bytes)";
+	if (!range_fits_address_space(effective_addr, data.size())) {
+		error = "Address range " + hex_addr(effective_addr) + " + " +
+		        std::to_string(data.size()) +
+		        " runs past the end of the 32-bit address space";
 		return;
 	}
+
+	const DEBUG_OutOfBandMemoryAccess out_of_band;
+
+	PhysPt failed_at = 0;
 
 	if (!expected_data.empty()) {
 		conflict_data.resize(expected_data.size());
 
-		MEM_BlockRead(effective_addr,
-		              conflict_data.data(),
-		              conflict_data.size());
+		if (!MEM_BlockReadOutOfBand(effective_addr,
+		                            conflict_data.data(),
+		                            conflict_data.size(),
+		                            &failed_at)) {
+			conflict_data.clear();
+			error = "No memory is mapped at " + hex_addr(failed_at) +
+			        ", so the If-Match precondition cannot be checked";
+			return;
+		}
 
 		if (expected_data != conflict_data) {
 			return;
@@ -189,7 +220,23 @@ void WriteMemoryCommand::Execute()
 		conflict_data.clear();
 	}
 
-	MEM_BlockWrite(effective_addr, data.data(), data.size());
+	if (!MEM_BlockWriteOutOfBand(effective_addr,
+	                             data.data(),
+	                             data.size(),
+	                             &failed_at)) {
+		error = "No writable memory is mapped at " + hex_addr(failed_at) +
+		        " (in the range " + hex_addr(effective_addr) + " + " +
+		        std::to_string(data.size()) +
+		        "); the bytes before it were written";
+		DEBUG_ResyncMemoryBreakpoints(effective_addr,
+		                              failed_at - effective_addr);
+		return;
+	}
+
+	// Write-watching memory breakpoints report a hit by noticing the byte
+	// differs from the value they last saw. This write is not the guest
+	// changing it, so re-baseline the ones it covers.
+	DEBUG_ResyncMemoryBreakpoints(effective_addr, data.size());
 }
 
 void WriteMemoryCommand::Put(const httplib::Request& req, httplib::Response& res)
@@ -200,11 +247,13 @@ void WriteMemoryCommand::Put(const httplib::Request& req, httplib::Response& res
 
 	std::string data;
 
-	if (req.get_header_value("Content-Type") == TypeJson) {
+	const auto content_type = media_type_of(req.get_header_value("Content-Type"));
+
+	if (content_type == TypeJson) {
 		auto j = json::parse(req.body);
 		data   = base64::from_base64(j.at("data").get<std::string>());
 
-	} else if (req.get_header_value("Content-Type") == TypeBinary) {
+	} else if (content_type == TypeBinary) {
 		data = req.body;
 
 	} else {
@@ -240,6 +289,7 @@ void WriteMemoryCommand::Put(const httplib::Request& req, httplib::Response& res
 	}
 
 	json j;
+	j["registers"]      = cmd.regs;
 	j["memory"]["addr"] = cmd.effective_addr;
 	if (!cmd.conflict_data.empty()) {
 		res.status = httplib::StatusCode::PreconditionFailed_412;

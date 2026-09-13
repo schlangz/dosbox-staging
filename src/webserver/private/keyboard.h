@@ -55,6 +55,9 @@ private:
 	// genuinely reached the guest instead of just reporting HTTP 200.
 	uint32_t dropped      = 0;
 	bool accepting_before = false;
+	// Non-null when the emulation is parked, so nothing will consume the
+	// injected event until it resumes. See input_block_reason().
+	const char* block_reason = nullptr;
 };
 
 // Types a run of text by writing characters straight into the BIOS keyboard
@@ -87,7 +90,14 @@ private:
 	// Characters with no BIOS-buffer representation, reported back rather
 	// than silently skipped.
 	std::string unsupported = {};
+	// Non-null when the emulation is parked, so the queue this fills will
+	// not drain until it resumes. See input_block_reason().
+	const char* block_reason = nullptr;
 };
+
+// Why injected input will not reach the guest right now, or nullptr when it
+// will. Emulation thread only.
+const char* input_block_reason();
 
 } // namespace Webserver
 

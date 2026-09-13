@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -15,6 +16,7 @@
 #include <list>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "audio/mixer.h"
@@ -137,6 +139,13 @@ static auto oldcpucpl = cpu.cpl;
 DBGBlock dbg          = {};
 Bitu cycle_count      = 0;
 static bool debugging = false;
+
+// Set on entry to DEBUG_Loop(), cleared by DEBUG_Enable() when a pause is
+// requested. Together with `debugging` this separates "a pause has been asked
+// for" from "the CPU has actually stopped": DEBUG_Enable() only installs
+// DEBUG_Loop as the loop handler, and DOSBOX_RunMachine() does not pick that
+// up until the loop currently running returns. See DEBUG_IsStopped().
+static bool debug_loop_entered = false;
 
 #define MAXCMDLEN 254
 struct SCodeViewData {
@@ -678,11 +687,65 @@ void CBreakpoint::Activate(bool _active)
 static std::list<CBreakpoint*> BPoints = {};
 
 #if C_HEAVY_DEBUGGER
+// Non-zero while an out-of-band consumer is reading guest memory. Counted
+// rather than boolean so nested guards compose.
+static uint32_t out_of_band_access_depth = 0;
+
+DEBUG_OutOfBandMemoryAccess::DEBUG_OutOfBandMemoryAccess()
+{
+	++out_of_band_access_depth;
+}
+
+DEBUG_OutOfBandMemoryAccess::~DEBUG_OutOfBandMemoryAccess()
+{
+	assert(out_of_band_access_depth > 0);
+	--out_of_band_access_depth;
+}
+
+// Watched address of a write-watching memory breakpoint, resolved the same way
+// CheckBreakpoint() resolves it.
+static PhysPt MemBreakpointAddress(const CBreakpoint& bp)
+{
+	if (bp.GetType() == BKPNT_MEMORY_LINEAR) {
+		return bp.GetOffset();
+	}
+	return GetAddress(bp.GetSegment(), bp.GetOffset());
+}
+
+void DEBUG_ResyncMemoryBreakpoints(const PhysPt start, const size_t len)
+{
+	if (len == 0) {
+		return;
+	}
+	const uint64_t end = static_cast<uint64_t>(start) + len;
+
+	for (CBreakpoint* bp : BPoints) {
+		const auto type = bp->GetType();
+		if (type != BKPNT_MEMORY && type != BKPNT_MEMORY_PROT &&
+		    type != BKPNT_MEMORY_LINEAR) {
+			continue;
+		}
+		const PhysPt watched = MemBreakpointAddress(*bp);
+		if (watched < start || watched >= end) {
+			continue;
+		}
+		uint8_t value = 0;
+		if (!mem_readb_checked(watched, &value)) {
+			bp->SetValue(value);
+		}
+	}
+}
+
 template <typename T>
 void DEBUG_UpdateMemoryReadBreakpoints(const PhysPt addr)
 {
 	static_assert(std::is_unsigned_v<T>);
 	static_assert(std::is_integral_v<T>);
+
+	// An out-of-band read is not the guest touching the address.
+	if (out_of_band_access_depth > 0) {
+		return;
+	}
 
 	for (CBreakpoint* bp : BPoints) {
 		if (bp->GetType() == BKPNT_MEMORY_READ) {
@@ -1524,6 +1587,11 @@ bool DEBUG_ExitLoop(void)
 bool DEBUG_IsDebugging()
 {
 	return debugging;
+}
+
+bool DEBUG_IsStopped()
+{
+	return debugging && debug_loop_entered;
 }
 
 /********************/
@@ -3392,10 +3460,46 @@ static std::vector<Webserver::CodeLine> DebugDisassemble(uint16_t cs_val,
 	return lines;
 }
 
-void Webserver::DebuggerStatusCommand::Execute()
+// Dispatches what DEBUG_Run() returned, exactly as normal_loop() and
+// DEBUG_CheckKeys() do with the same value.
+//
+// A positive value names a DOSBox callback whose host side has not run yet.
+// Callbacks are how INT 21h, INT 10h, INT 33h and the rest of the DOS/BIOS
+// surface are implemented, so dropping one leaves the guest continuing past an
+// interrupt whose work never happened. A negative value unwinds the machine
+// loop, which is how a nested page-fault core reports that it is done.
+//
+// Returns a note when there is something the caller should know about, and an
+// empty string otherwise. The instruction itself ran either way, so a note is
+// not a failure of the command.
+static std::string DispatchRunResult(const int32_t ret)
 {
-	paused = debugging;
-	if (paused) {
+	if (ret < 0) {
+		exitLoop   = true;
+		CPU_Cycles = CPU_CycleLeft = 0;
+		return "The instruction unwound the machine loop; the reported "
+		       "state may not be where the guest now is";
+	}
+	if (ret == 0) {
+		return {};
+	}
+	if (ret >= CB_MAX) {
+		return "The instruction returned callback index " +
+		       std::to_string(ret) + ", which is out of range";
+	}
+
+	const Bitu callback_ret = (*Callback_Handlers[ret])();
+	if (callback_ret) {
+		exitLoop   = true;
+		CPU_Cycles = CPU_CycleLeft = 0;
+	}
+	return {};
+}
+
+void Webserver::DebuggerPollStopCommand::Execute()
+{
+	stopped = DEBUG_IsStopped();
+	if (stopped) {
 		regs.load();
 		code = DebugDisassemble(SegValue(cs), reg_eip, 12);
 	}
@@ -3405,22 +3509,44 @@ void Webserver::DebuggerStatusCommand::Get(const httplib::Request&,
                                            httplib::Response& res)
 {
 	DebuggerStatusCommand cmd;
-	cmd.WaitForCompletion();
+	cmd.WaitForCompletion(Webserver::StatusCommandTimeoutMs);
+
+	if (!cmd.error.empty()) {
+		throw std::runtime_error(cmd.error);
+	}
 
 	json j;
-	j["paused"] = cmd.paused;
-	if (cmd.paused) {
+	j["paused"] = cmd.stopped;
+	if (cmd.stopped) {
 		j["registers"] = cmd.regs;
 		j["code"]      = cmd.code;
 	}
 	send_json(res, j);
 }
 
+// How long the enable handler waits for a requested pause to actually land.
+// The request zeroes the cycle budget and raises the exit-loop flag, so the
+// running loop handler returns on its next turn; this only has to outlast one
+// such turn plus whatever the host was busy with.
+constexpr auto DebuggerStopTimeoutMs  = 3000;
+constexpr auto DebuggerStopPollIntervalMs = 5;
+
 void Webserver::DebuggerEnableCommand::Execute()
 {
-	DEBUG_Enable(true);
-	regs.load();
-	code = DebugDisassemble(SegValue(cs), reg_eip, 12);
+	stopped = DEBUG_IsStopped();
+	if (stopped) {
+		regs.load();
+		code = DebugDisassemble(SegValue(cs), reg_eip, 12);
+		return;
+	}
+
+	// DEBUG_Enable() on its own only installs DEBUG_Loop as the loop
+	// handler, which DOSBOX_RunMachine() does not pick up until the loop
+	// currently running returns; normal_loop() keeps executing the guest
+	// until its tick budget drains. Raising the exit-loop flag and zeroing
+	// the cycle budget is what makes it return at the next instruction
+	// boundary, and is what the breakpoint-hit path does.
+	DEBUG_EnableDebugger();
 }
 
 void Webserver::DebuggerEnableCommand::Post(const httplib::Request&,
@@ -3429,20 +3555,55 @@ void Webserver::DebuggerEnableCommand::Post(const httplib::Request&,
 	DebuggerEnableCommand cmd;
 	cmd.WaitForCompletion();
 
+	if (!cmd.error.empty()) {
+		throw std::runtime_error(cmd.error);
+	}
+
+	bool stopped                     = cmd.stopped;
+	Registers regs                   = cmd.regs;
+	std::vector<Webserver::CodeLine> code = cmd.code;
+
+	// The pause was requested, not completed. Poll until the CPU has come
+	// to rest so the reported registers and disassembly are the ones at the
+	// stop, not the ones at the request.
+	auto waited = 0;
+	while (!stopped && waited < DebuggerStopTimeoutMs) {
+		std::this_thread::sleep_for(
+		        std::chrono::milliseconds(DebuggerStopPollIntervalMs));
+		waited += DebuggerStopPollIntervalMs;
+
+		DebuggerPollStopCommand poll;
+		poll.WaitForCompletion(Webserver::StatusCommandTimeoutMs);
+		if (!poll.error.empty()) {
+			throw std::runtime_error(poll.error);
+		}
+		stopped = poll.stopped;
+		regs    = poll.regs;
+		code    = poll.code;
+	}
+
 	json j;
-	j["paused"]     = true;
-	j["registers"] = cmd.regs;
-	j["code"]       = cmd.code;
+	j["paused"] = stopped;
+	if (stopped) {
+		j["registers"] = regs;
+		j["code"]      = code;
+	} else {
+		j["error"] = "The pause was requested but the CPU had not stopped after " +
+		             std::to_string(DebuggerStopTimeoutMs) + " ms";
+		res.status = httplib::StatusCode::GatewayTimeout_504;
+	}
 	send_json(res, j);
 }
 
 void Webserver::DebuggerStepCommand::Execute()
 {
-	if (!debugging) {
+	if (!DEBUG_IsStopped()) {
 		error = "Not paused in the debugger";
 		return;
 	}
-	DEBUG_Run(1, true); // matches F11's own handler: single instruction, stays in debug loop
+	// Matches F11's own handler: single instruction, stays in debug loop.
+	note = DispatchRunResult(DEBUG_Run(1, true));
+
 	regs.load();
 	code = DebugDisassemble(SegValue(cs), reg_eip, 12);
 }
@@ -3461,17 +3622,20 @@ void Webserver::DebuggerStepCommand::Post(const httplib::Request&,
 	j["paused"]     = true;
 	j["registers"] = cmd.regs;
 	j["code"]       = cmd.code;
+	if (!cmd.note.empty()) {
+		j["warning"] = cmd.note;
+	}
 	send_json(res, j);
 }
 
 void Webserver::DebuggerGoCommand::Execute()
 {
-	if (!debugging) {
+	if (!DEBUG_IsStopped()) {
 		error = "Not paused in the debugger";
 		return;
 	}
 	debugging = false;
-	DEBUG_Run(1, false);
+	note      = DispatchRunResult(DEBUG_Run(1, false));
 }
 
 void Webserver::DebuggerGoCommand::Post(const httplib::Request&,
@@ -3486,6 +3650,9 @@ void Webserver::DebuggerGoCommand::Post(const httplib::Request&,
 
 	json j;
 	j["resumed"] = true;
+	if (!cmd.note.empty()) {
+		j["warning"] = cmd.note;
+	}
 	send_json(res, j);
 }
 
@@ -3501,13 +3668,35 @@ void Webserver::ReDumpToggleCommand::Post(const httplib::Request&,
 	ReDumpToggleCommand cmd;
 	cmd.WaitForCompletion();
 
+	if (!cmd.error.empty()) {
+		throw std::runtime_error(cmd.error);
+	}
+
 	json j;
 	j["enabled"] = cmd.enabled;
 	send_json(res, j);
 }
 
+// Message for a seg:offset whose selector has no descriptor right now, so the
+// address the breakpoint would sit at is the real-mode fallback rather than
+// anything the guest addresses.
+static std::string UnresolvableSelectorNote(const uint16_t seg)
+{
+	char buf[160];
+	safe_sprintf(buf,
+	             "Selector %04X has no descriptor in the current tables, so "
+	             "seg:offset was resolved as %04X * 16. The watched address "
+	             "is almost certainly not the intended one.",
+	             seg,
+	             seg);
+	return buf;
+}
+
 void Webserver::DebuggerAddBreakpointCommand::Execute()
 {
+	resolved = CPU_IsSelectorResolvable(seg);
+	linear   = GetAddress(seg, off);
+
 	CBreakpoint::AddBreakpoint(seg, off, false);
 }
 
@@ -3520,9 +3709,21 @@ void Webserver::DebuggerAddBreakpointCommand::Post(const httplib::Request& req,
 	DebuggerAddBreakpointCommand cmd(seg, off);
 	cmd.WaitForCompletion();
 
+	if (!cmd.error.empty()) {
+		throw std::runtime_error(cmd.error);
+	}
+
 	json j;
 	j["segment"] = seg;
 	j["offset"]  = off;
+	// The address actually watched. Worth reading back: the path
+	// parameters are parsed as decimal unless written with an 0x prefix,
+	// which is the opposite of the BP command's hex-only convention.
+	j["linear"]   = cmd.linear;
+	j["resolved"] = cmd.resolved;
+	if (!cmd.resolved) {
+		j["warning"] = UnresolvableSelectorNote(seg);
+	}
 	send_json(res, j);
 }
 
@@ -3540,6 +3741,10 @@ void Webserver::DebuggerDeleteBreakpointCommand::Delete(const httplib::Request& 
 	DebuggerDeleteBreakpointCommand cmd(seg, off);
 	cmd.WaitForCompletion();
 
+	if (!cmd.error.empty()) {
+		throw std::runtime_error(cmd.error);
+	}
+
 	json j;
 	j["removed"] = cmd.removed;
 	send_json(res, j);
@@ -3547,6 +3752,9 @@ void Webserver::DebuggerDeleteBreakpointCommand::Delete(const httplib::Request& 
 
 void Webserver::DebuggerAddLogpointCommand::Execute()
 {
+	resolved = CPU_IsSelectorResolvable(seg);
+	linear   = GetAddress(seg, off);
+
 	CBreakpoint::AddLogpoint(seg, off, label);
 }
 
@@ -3572,11 +3780,20 @@ void Webserver::DebuggerAddLogpointCommand::Post(const httplib::Request& req,
 	DebuggerAddLogpointCommand cmd(seg, off, label);
 	cmd.WaitForCompletion();
 
+	if (!cmd.error.empty()) {
+		throw std::runtime_error(cmd.error);
+	}
+
 	json j;
-	j["segment"] = seg;
-	j["offset"]  = off;
-	j["label"]   = label;
-	j["file"]    = "LOGPOINTS.TXT";
+	j["segment"]  = seg;
+	j["offset"]   = off;
+	j["label"]    = label;
+	j["file"]     = "LOGPOINTS.TXT";
+	j["linear"]   = cmd.linear;
+	j["resolved"] = cmd.resolved;
+	if (!cmd.resolved) {
+		j["warning"] = UnresolvableSelectorNote(seg);
+	}
 	send_json(res, j);
 }
 
@@ -3593,6 +3810,10 @@ void Webserver::DebuggerDeleteLogpointCommand::Delete(const httplib::Request& re
 
 	DebuggerDeleteLogpointCommand cmd(seg, off);
 	cmd.WaitForCompletion();
+
+	if (!cmd.error.empty()) {
+		throw std::runtime_error(cmd.error);
+	}
 
 	json j;
 	j["removed"] = cmd.removed;
@@ -3651,6 +3872,10 @@ void Webserver::DebuggerAddLogsigCommand::Post(const httplib::Request& req,
 	DebuggerAddLogsigCommand cmd(signature, offset, label);
 	cmd.WaitForCompletion();
 
+	if (!cmd.error.empty()) {
+		throw std::runtime_error(cmd.error);
+	}
+
 	json j;
 	j["signature_bytes"] = signature.size();
 	j["offset"]          = offset;
@@ -3675,6 +3900,10 @@ void Webserver::DebuggerDeleteLogsigCommand::Delete(const httplib::Request& req,
 	DebuggerDeleteLogsigCommand cmd(signature, offset);
 	cmd.WaitForCompletion();
 
+	if (!cmd.error.empty()) {
+		throw std::runtime_error(cmd.error);
+	}
+
 	json j;
 	j["removed"] = cmd.removed;
 	send_json(res, j);
@@ -3691,6 +3920,10 @@ void Webserver::CallrecStatusCommand::Get(const httplib::Request&,
 {
 	CallrecStatusCommand cmd;
 	cmd.WaitForCompletion();
+
+	if (!cmd.error.empty()) {
+		throw std::runtime_error(cmd.error);
+	}
 
 	json j;
 	j["enabled"]     = cmd.enabled;
@@ -3718,6 +3951,10 @@ void Webserver::CallrecSetCommand::Post(const httplib::Request& req,
 	CallrecSetCommand cmd(enable);
 	cmd.WaitForCompletion();
 
+	if (!cmd.error.empty()) {
+		throw std::runtime_error(cmd.error);
+	}
+
 	json out;
 	out["enabled"] = enable;
 	send_json(res, out);
@@ -3732,7 +3969,13 @@ void Webserver::CallrecDumpCommand::Post(const httplib::Request&,
                                          httplib::Response& res)
 {
 	CallrecDumpCommand cmd;
-	cmd.WaitForCompletion();
+	// Writes the whole recorded edge set to disk, which is not a quick
+	// operation on the emulation thread.
+	cmd.WaitForCompletion(Webserver::SlowCommandTimeoutMs);
+
+	if (!cmd.error.empty()) {
+		throw std::runtime_error(cmd.error);
+	}
 
 	if (cmd.written < 0) {
 		throw std::runtime_error("CALLREC.JSONL could not be written");
@@ -3746,7 +3989,10 @@ void Webserver::CallrecDumpCommand::Post(const httplib::Request&,
 
 void Webserver::DebuggerCommandCommand::Execute()
 {
-	if (!debugging) {
+	// Gated on the CPU having actually stopped, not on a pause having been
+	// requested: commands here resolve CS:/DS:-relative addresses against
+	// live registers, which are still moving until the stop lands.
+	if (!DEBUG_IsStopped()) {
 		error = "Not paused in the debugger";
 		return;
 	}
@@ -3755,7 +4001,7 @@ void Webserver::DebuggerCommandCommand::Execute()
 	buf.push_back('\0');
 	ParseCommand(buf.data());
 
-	paused = debugging;
+	paused = DEBUG_IsStopped();
 	if (paused) {
 		regs.load();
 		code = DebugDisassemble(SegValue(cs), reg_eip, 12);
@@ -3771,8 +4017,11 @@ void Webserver::DebuggerCommandCommand::Post(const httplib::Request& req,
 	}
 	auto command = j.at("command").get<std::string>();
 
+	// The escape hatch for anything the typed routes do not cover, so it is
+	// also the route most likely to be issued into an emulator that is busy
+	// with a previously started capture.
 	DebuggerCommandCommand cmd(command);
-	cmd.WaitForCompletion();
+	cmd.WaitForCompletion(Webserver::SlowCommandTimeoutMs);
 
 	if (!cmd.error.empty()) {
 		throw std::runtime_error(cmd.error);
@@ -4085,6 +4334,11 @@ uint32_t DEBUG_CheckKeys(void)
 
 Bitu DEBUG_Loop(void)
 {
+	// Reaching here is what makes a requested pause real: the previous loop
+	// handler has returned and no further guest instruction runs until this
+	// one lets it.
+	debug_loop_entered = true;
+
 	// TODO Disable sound
 	GFX_PollAndHandleEvents();
 
@@ -4144,8 +4398,11 @@ void DEBUG_Enable(bool pressed)
 		was_help_shown = true;
 	}
 
-	// Start the debugging loops
-	debugging = true;
+	// Start the debugging loops. The pause is requested here and becomes
+	// real only once DEBUG_Loop() is actually entered, which is what
+	// `debug_loop_entered` tracks.
+	debugging          = true;
+	debug_loop_entered = false;
 	DOSBOX_SetLoop(&DEBUG_Loop);
 
 	// Anything captured up to this pause should be readable now, since

@@ -623,4 +623,14 @@ bool CPU_ShouldHltOnIdle();
 // state, so it is only valid on the emulation thread.
 PhysPt CPU_LinearAddressOf(uint16_t seg, uint32_t offset);
 
+// Whether a literal segment/selector number resolves to a real base right now.
+//
+// False only in protected mode, for a selector the descriptor tables do not
+// currently describe. CPU_LinearAddressOf() then falls back to seg * 16, which
+// is the correct answer in real and virtual-8086 mode and an arbitrary one
+// here. Callers that store a resolved address for later (arming a breakpoint)
+// must report that instead of arming at the fallback address. Reads live CPU
+// state, so it is only valid on the emulation thread.
+bool CPU_IsSelectorResolvable(uint16_t seg);
+
 #endif

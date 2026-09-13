@@ -177,6 +177,23 @@ static inline uint64_t phys_readq(PhysPt addr)
 
 void MEM_BlockWrite(PhysPt pt, const void *data, size_t size);
 void MEM_BlockRead(PhysPt pt, void *data, Bitu size);
+
+// Block access for consumers that are not the guest CPU (the HTTP memory API).
+//
+// The plain MEM_Block* functions above are the guest's own access path: a
+// linear address with no present page raises a real #PF in the guest and runs
+// its fault handler, from whatever context the read was issued in. That is
+// correct for the CPU and wrong for an observer, which must not alter guest
+// state just by looking at it.
+//
+// These stop at the first address that cannot be reached without faulting,
+// report it through `failed_at` when that pointer is given, and return false.
+// Pages backed by a device handler (video memory and friends) are still
+// accessed normally.
+bool MEM_BlockReadOutOfBand(PhysPt pt, void* data, size_t size,
+                            PhysPt* failed_at = nullptr);
+bool MEM_BlockWriteOutOfBand(PhysPt pt, const void* data, size_t size,
+                             PhysPt* failed_at = nullptr);
 void MEM_BlockCopy(PhysPt dest, PhysPt src, Bitu size);
 void MEM_StrCopy(PhysPt pt, char *data, Bitu size);
 

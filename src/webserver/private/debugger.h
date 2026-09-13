@@ -23,52 +23,76 @@ struct CodeLine {
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(CodeLine, seg, off, text)
 
+// One poll of "has the CPU actually come to rest in the debugger", plus the
+// state at that point. `stopped` follows DEBUG_IsStopped(), not
+// DEBUG_IsDebugging(): a requested pause only becomes real once the running
+// loop handler returns, and until then the guest is still executing.
+class DebuggerPollStopCommand : public Command {
+public:
+	void Execute() override;
+
+	bool stopped               = false;
+	Registers regs             = {};
+	std::vector<CodeLine> code = {};
+};
+
 // Reports whether the CPU is currently paused in the interactive
 // debugger (from a breakpoint hit or a prior Enable/Step call) or
 // running freely. Poll this after Go to detect the next real stop --
 // there's no push notification, this is the wait-for-stop mechanism.
-class DebuggerStatusCommand : public Command {
+class DebuggerStatusCommand : public DebuggerPollStopCommand {
 public:
-	void Execute() override;
 	static void Get(const httplib::Request&, httplib::Response&);
-
-private:
-	bool paused                = false;
-	Registers regs              = {};
-	std::vector<CodeLine> code = {};
 };
 
 // Pauses free-running emulation and enters the debugger, same as the
-// interactive Alt+Pause hotkey.
+// interactive Alt+Pause hotkey. The response reports the state at the
+// instruction the CPU actually stopped on, which the handler waits for.
 class DebuggerEnableCommand : public Command {
 public:
 	void Execute() override;
 	static void Post(const httplib::Request&, httplib::Response&);
 
 private:
-	Registers regs              = {};
+	bool stopped               = false;
+	Registers regs             = {};
 	std::vector<CodeLine> code = {};
 };
 
-// Executes exactly one instruction. Only valid while paused.
+// Executes exactly one instruction. Only valid while the CPU has actually
+// stopped, not merely while a pause has been requested.
 class DebuggerStepCommand : public Command {
 public:
 	void Execute() override;
 	static void Post(const httplib::Request&, httplib::Response&);
 
 private:
-	Registers regs              = {};
+	Registers regs             = {};
 	std::vector<CodeLine> code = {};
+	// Set when the executed instruction produced something the caller
+	// should know about, such as unwinding the machine loop. The
+	// instruction still ran, so this is reported as a warning rather than
+	// an error.
+	std::string note = {};
 };
 
-// Resumes free-running emulation. Only valid while paused. Returns
+// Resumes free-running emulation. Only valid while stopped. Returns
 // immediately -- poll DebuggerStatusCommand to see when it stops again.
 class DebuggerGoCommand : public Command {
 public:
 	void Execute() override;
 	static void Post(const httplib::Request&, httplib::Response&);
+
+private:
+	std::string note = {};
 };
 
+// A breakpoint resolves seg:offset to a linear address once, when it is armed,
+// and watches that address from then on. In protected mode a selector the
+// descriptor tables do not describe has no such address, and
+// CPU_LinearAddressOf() answers with the real-mode seg * 16 instead, so the
+// breakpoint would sit at an unrelated location and never fire. `resolved`
+// reports whether the stored `linear` means anything.
 class DebuggerAddBreakpointCommand : public Command {
 public:
 	DebuggerAddBreakpointCommand(const uint16_t seg, const uint32_t off)
@@ -80,8 +104,10 @@ public:
 	static void Post(const httplib::Request&, httplib::Response&);
 
 private:
-	uint16_t seg = 0;
-	uint32_t off = 0;
+	uint16_t seg   = 0;
+	uint32_t off   = 0;
+	uint32_t linear = 0;
+	bool resolved  = false;
 };
 
 class DebuggerDeleteBreakpointCommand : public Command {
@@ -119,9 +145,13 @@ public:
 	static void Post(const httplib::Request&, httplib::Response&);
 
 private:
-	uint16_t seg = 0;
-	uint32_t off = 0;
+	uint16_t seg      = 0;
+	uint32_t off      = 0;
 	std::string label = {};
+	// As for DebuggerAddBreakpointCommand: a logpoint watches the address
+	// its seg:offset resolved to at arm time.
+	uint32_t linear = 0;
+	bool resolved   = false;
 };
 
 class DebuggerDeleteLogpointCommand : public Command {

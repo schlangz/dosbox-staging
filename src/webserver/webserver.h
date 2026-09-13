@@ -19,6 +19,11 @@ namespace Webserver {
 constexpr auto TypeJson   = "application/json";
 constexpr auto TypeBinary = "application/octet-stream";
 
+// The media type of a Content-Type header, without any ";"-separated
+// parameters. "application/json; charset=utf-8" and "application/json" name
+// the same type and have to compare equal.
+std::string media_type_of(const std::string& content_type);
+
 enum class Source {
 	Param, // get_param_value
 	Path,  // get_path_value
@@ -48,7 +53,8 @@ static T num_param(const httplib::Request& req, Source src, const std::string& n
 	int base          = 10;
 	const char* first = str.data();
 	const char* last  = str.data() + str.size();
-	if (str.size() >= 2 && str[0] == '0' && std::tolower(str[1]) == 'x') {
+	if (str.size() >= 2 && str[0] == '0' &&
+	    std::tolower(static_cast<unsigned char>(str[1])) == 'x') {
 		first += 2;
 		base = 16;
 	}
@@ -66,6 +72,10 @@ static T num_param(const httplib::Request& req, Source src, const std::string& n
 }
 
 void send_json(httplib::Response& res, const nlohmann::json& j);
+
+// Failure response in the same shape the exception handler produces, so every
+// error the API returns carries a readable "error" field.
+void send_error(httplib::Response& res, const int status, const std::string& msg);
 
 } // namespace Webserver
 

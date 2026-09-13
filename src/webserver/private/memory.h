@@ -76,6 +76,7 @@ private:
 
 	// Response
 	uint32_t effective_addr = {};
+	Registers regs          = {};
 	// Only filled if expected_data was set and didn't match.
 	std::string conflict_data = {};
 };

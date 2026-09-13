@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <exception>
 #include <mutex>
 #include <vector>
 
@@ -37,7 +38,9 @@ void Bridge::ExecuteCommand(Command& cmd, const uint32_t timeout_ms)
 		if (it != queue.end()) {
 			queue.erase(it);
 		}
-		throw std::runtime_error("Failed to execute command: timeout");
+		throw TimeoutError(
+		        "The emulation thread did not pick the command up within " +
+		        std::to_string(timeout_ms) + " ms");
 	}
 }
 
@@ -49,7 +52,17 @@ void Bridge::ProcessRequests()
 		return;
 	}
 	for (auto* cmd : queue) {
-		cmd->Execute();
+		// An exception here would otherwise unwind the emulation thread,
+		// which has no handler anywhere up to main(). Report it the same
+		// way a command reports a failure it detected itself, and let the
+		// rest of the batch run.
+		try {
+			cmd->Execute();
+		} catch (const std::exception& e) {
+			cmd->error = e.what();
+		} catch (...) {
+			cmd->error = "Unknown error while executing command";
+		}
 		cmd->done = true;
 	}
 
