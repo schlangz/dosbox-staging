@@ -178,27 +178,12 @@ static auto histBuffPos                = histBuff.end();
 /* Helpers */
 /***********/
 
-uint32_t PhysMakeProt(uint16_t selector, uint32_t offset)
-{
-	Descriptor desc;
-	if (cpu.gdt.GetDescriptor(selector, desc)) {
-		return desc.GetBase() + offset;
-	}
-	return 0;
-}
-
 uint32_t GetAddress(uint16_t seg, uint32_t offset)
 {
-	if (seg == SegValue(cs)) {
-		return SegPhys(cs) + offset;
-	}
-	if (cpu.pmode && !(reg_flags & FLAG_VM)) {
-		Descriptor desc;
-		if (cpu.gdt.GetDescriptor(seg, desc)) {
-			return PhysMakeProt(seg, offset);
-		}
-	}
-	return (seg << 4) + offset;
+	// Shared with the HTTP memory API, so that MEMDUMPBIN/D/BP and
+	// GET/PUT /api/v1/memory/... can never disagree about what a given
+	// seg:offset means.
+	return CPU_LinearAddressOf(seg, offset);
 }
 
 static char empty_sel[] = {' ', ' ', 0};

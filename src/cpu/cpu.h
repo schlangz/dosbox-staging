@@ -611,4 +611,16 @@ void CPU_SetFlagsw(const uint32_t word);
 // program is idle
 bool CPU_ShouldHltOnIdle();
 
+// Resolves a guest seg:offset pair to the linear address the CPU itself would
+// address right now: through the segment's descriptor base in protected mode,
+// and as seg * 16 in real and virtual-8086 mode. The current CS is resolved
+// through its own already-loaded descriptor cache rather than re-reading the
+// descriptor tables.
+//
+// Every out-of-band consumer of a guest address (the interactive debugger, the
+// HTTP memory API) must go through this so that the same seg:offset can never
+// mean two different locations depending on which one asked. Reads live CPU
+// state, so it is only valid on the emulation thread.
+PhysPt CPU_LinearAddressOf(uint16_t seg, uint32_t offset);
+
 #endif

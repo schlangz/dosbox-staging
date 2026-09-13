@@ -10,6 +10,9 @@
 #include "json/json.h"
 #include "utils/string_utils.h"
 
+// Spelled out in full: a bare "cpu.h" here resolves to this directory's own
+// private/cpu.h, not the emulated CPU's header.
+#include "cpu/cpu.h"
 #include "cpu/registers.h"
 #include "dos/dos_memory.h"
 #include "hardware/memory.h"
@@ -52,31 +55,56 @@ static uint32_t base_segment_to_offset(const Segment segment)
 	}
 }
 
-static void parse_mem_addr(const httplib::Request& req, Segment& segment,
-                           uint32_t& offset)
+uint32_t resolve_mem_addr(const MemAddr& addr)
 {
-	offset  = num_param<uint32_t>(req, Source::Path, "offset");
-	segment = Segment::None;
+	switch (addr.base) {
+	case Segment::None:
+		// No segment given: the offset is already a linear address.
+		return addr.offset;
+
+	case Segment::Numeric:
+		// A literal segment/selector number only means something
+		// together with the CPU's current addressing mode, which is
+		// why this cannot be folded into the offset at parse time.
+		// Same resolver the interactive debugger uses, so a given
+		// seg:offset reads the same bytes through either interface.
+		return CPU_LinearAddressOf(addr.segment, addr.offset);
+
+	default:
+		// A segment register: its loaded descriptor cache already
+		// holds the right base in every mode.
+		return base_segment_to_offset(addr.base) + addr.offset;
+	}
+}
+
+static MemAddr parse_mem_addr(const httplib::Request& req)
+{
+	MemAddr addr = {};
+
+	addr.offset = num_param<uint32_t>(req, Source::Path, "offset");
+	addr.base   = Segment::None;
 
 	if (req.path_params.find("segment") != req.path_params.end()) {
 		auto& segment_param = req.path_params.at("segment");
-		segment             = str_to_base_segment(segment_param);
+		addr.base           = str_to_base_segment(segment_param);
 
-		// Segment can either be a register to resolve later or an
-		// address which we can already resolve here.
-		if (segment == Segment::None) {
-			const auto seg_addr = PhysicalMake(
-			        num_param<uint16_t>(req, Source::Path, "segment"), 0);
-
-			offset += seg_addr;
+		// Not a register name, so it must be a literal segment or
+		// protected-mode selector. It is kept as-is and resolved on
+		// the emulation thread; folding it into the offset here would
+		// hard-code real-mode addressing.
+		if (addr.base == Segment::None) {
+			addr.base = Segment::Numeric;
+			addr.segment = num_param<uint16_t>(req, Source::Path, "segment");
 		}
 	}
+
+	return addr;
 }
 
 void ReadMemoryCommand::Execute()
 {
 	regs.load();
-	effective_addr = base_segment_to_offset(base) + offset;
+	effective_addr = resolve_mem_addr(addr);
 
 	LOG_DEBUG("API: ReadMemoryCommand(0x%06x, %d)", effective_addr, len);
 
@@ -103,11 +131,7 @@ void ReadMemoryCommand::Get(const Request& req, Response& res)
 	// unreasonably large size.
 	auto num_bytes = num_param<uint32_t>(req, Source::Path, "len", 1, 128 * 1024 * 1024);
 
-	Segment segment;
-	uint32_t offset;
-	parse_mem_addr(req, segment, offset);
-
-	ReadMemoryCommand cmd(segment, offset, num_bytes);
+	ReadMemoryCommand cmd(parse_mem_addr(req), num_bytes);
 	cmd.WaitForCompletion();
 
 	if (!cmd.error.empty()) {
@@ -133,7 +157,7 @@ void ReadMemoryCommand::Get(const Request& req, Response& res)
 
 void WriteMemoryCommand::Execute()
 {
-	effective_addr = base_segment_to_offset(base) + offset;
+	effective_addr = resolve_mem_addr(addr);
 
 	LOG_DEBUG("API: WriteMemoryCommand(0x%06x, %d)", effective_addr, data.size());
 
@@ -170,9 +194,7 @@ void WriteMemoryCommand::Execute()
 
 void WriteMemoryCommand::Put(const httplib::Request& req, httplib::Response& res)
 {
-	Segment segment;
-	uint32_t offset;
-	parse_mem_addr(req, segment, offset);
+	const auto addr = parse_mem_addr(req);
 
 	constexpr size_t MaxWriteBytes = 128 * 1024 * 1024; // 128 MiB
 
@@ -210,7 +232,7 @@ void WriteMemoryCommand::Put(const httplib::Request& req, httplib::Response& res
 		expected_data = base64::from_base64(etag);
 	}
 
-	WriteMemoryCommand cmd(segment, offset, std::move(data), std::move(expected_data));
+	WriteMemoryCommand cmd(addr, std::move(data), std::move(expected_data));
 	cmd.WaitForCompletion();
 
 	if (!cmd.error.empty()) {

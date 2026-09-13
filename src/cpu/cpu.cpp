@@ -4280,6 +4280,35 @@ bool CPU_ShouldHltOnIdle()
 	return should_hlt_on_idle && (reg_flags & FLAG_IF);
 }
 
+PhysPt CPU_LinearAddressOf(const uint16_t seg, const uint32_t offset)
+{
+	// The loaded CS descriptor cache is authoritative for the current code
+	// segment in every mode, and stays right even if the descriptor table
+	// entry behind it was since overwritten.
+	if (seg == SegValue(cs)) {
+		return static_cast<PhysPt>(SegPhys(cs) + offset);
+	}
+
+	// The null selector (GDT index 0, any RPL) never designates memory --
+	// loading it into a segment register is what faults on real hardware.
+	// GDT entry 0 is therefore free storage that system software does use:
+	// stashing the LGDT pseudo-descriptor there is a common trick, and
+	// decoding those bytes as a segment descriptor yields a meaningless
+	// base. Treat it as unresolvable instead.
+	const bool is_null_selector = (seg & 0xfffc) == 0;
+
+	if (cpu.pmode && !(reg_flags & FLAG_VM) && !is_null_selector) {
+		Descriptor desc = {};
+		if (cpu.gdt.GetDescriptor(seg, desc)) {
+			return static_cast<PhysPt>(desc.GetBase() + offset);
+		}
+		// Not a valid selector: fall through to the real-mode reading
+		// rather than inventing an address.
+	}
+
+	return static_cast<PhysPt>((seg << 4) + offset);
+}
+
 void CPU_AddConfigSection(const ConfigPtr& conf)
 {
 	assert(conf);
